@@ -28,8 +28,14 @@ GitHub API coverage:
 Linear API coverage:
   Issue queries and mutations include numeric priority and derived priorityLabel fields.
 
+Chargebee API coverage:
+  Subscription lifecycle, invoicing and the time machine, which advances the clock and runs
+  every renewal it makes due. Proration, tax, dunning and estimates return 501 not_emulated
+  rather than an invented figure. See the Coverage tab in the inspector.
+
 Webhook signatures:
   Stripe webhook secrets produce a Stripe-Signature header for raw-body verification.
+  Chargebee webhook secrets become HTTP basic credentials, as Chargebee sends no signature.
 `,
   );
 
