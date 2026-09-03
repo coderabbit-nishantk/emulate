@@ -9,9 +9,18 @@ import type { Entity } from "@emulators/core";
  * a response exposes has to be derived from that clock rather than from real time.
  */
 interface Timestamped {
-  created: number;
-  updated: number;
+  readonly created: number;
+  readonly updated: number;
 }
+
+/**
+ * A mutable partial of a stored row, for assembling an update.
+ *
+ * Rows are readonly so that nothing can edit one in place behind the store's back;
+ * a patch is built here and handed to `Collection.update`, which is the only way
+ * state changes.
+ */
+export type Draft<T> = { -readonly [K in keyof T]?: T[K] };
 
 export type PeriodUnit = "day" | "week" | "month" | "year";
 
@@ -32,152 +41,152 @@ export type InvoiceStatus = "paid" | "posted" | "payment_due" | "not_paid" | "vo
  * what Chargebee itself generates.
  */
 export interface ChargebeeMeta extends Entity {
-  now: number;
-  invoice_seq: number;
+  readonly now: number;
+  readonly invoice_seq: number;
 }
 
 export interface ChargebeeBillingAddress {
-  first_name?: string;
-  last_name?: string;
-  line1?: string;
-  line2?: string;
-  city?: string;
-  state?: string;
-  state_code?: string;
-  country?: string;
-  zip?: string;
+  readonly first_name?: string;
+  readonly last_name?: string;
+  readonly line1?: string;
+  readonly line2?: string;
+  readonly city?: string;
+  readonly state?: string;
+  readonly state_code?: string;
+  readonly country?: string;
+  readonly zip?: string;
 }
 
 export interface ChargebeeCustomer extends Entity, Timestamped {
-  chargebee_id: string;
-  first_name: string | null;
-  last_name: string | null;
-  email: string | null;
-  company: string | null;
-  phone: string | null;
-  locale: string | null;
-  auto_collection: "on" | "off";
-  net_term_days: number;
-  preferred_currency_code: string;
-  card_status: "no_card" | "valid" | "expiring" | "expired";
-  primary_payment_source_id: string | null;
-  billing_address: ChargebeeBillingAddress | null;
-  meta_data: Record<string, unknown>;
-  cf_fields: Record<string, string>;
+  readonly chargebee_id: string;
+  readonly first_name: string | null;
+  readonly last_name: string | null;
+  readonly email: string | null;
+  readonly company: string | null;
+  readonly phone: string | null;
+  readonly locale: string | null;
+  readonly auto_collection: "on" | "off";
+  readonly net_term_days: number;
+  readonly preferred_currency_code: string;
+  readonly card_status: "no_card" | "valid" | "expiring" | "expired";
+  readonly primary_payment_source_id: string | null;
+  readonly billing_address: ChargebeeBillingAddress | null;
+  readonly meta_data: Record<string, unknown>;
+  readonly cf_fields: Record<string, string>;
 }
 
 export interface ChargebeeItemFamily extends Entity, Timestamped {
-  chargebee_id: string;
-  name: string;
+  readonly chargebee_id: string;
+  readonly name: string;
 }
 
 export interface ChargebeeItem extends Entity, Timestamped {
-  chargebee_id: string;
-  name: string;
-  external_name: string | null;
-  type: ItemType;
-  item_family_id: string;
-  metered: boolean;
+  readonly chargebee_id: string;
+  readonly name: string;
+  readonly external_name: string | null;
+  readonly type: ItemType;
+  readonly item_family_id: string;
+  readonly metered: boolean;
 }
 
 export interface ChargebeeItemPrice extends Entity, Timestamped {
-  chargebee_id: string;
-  name: string;
-  external_name: string | null;
-  item_family_id: string;
-  item_id: string;
-  item_type: ItemType;
-  pricing_model: PricingModel;
-  price: number;
-  period: number;
-  period_unit: PeriodUnit;
-  free_quantity: number;
-  currency_code: string;
-  trial_period: number | null;
-  trial_period_unit: PeriodUnit | null;
+  readonly chargebee_id: string;
+  readonly name: string;
+  readonly external_name: string | null;
+  readonly item_family_id: string;
+  readonly item_id: string;
+  readonly item_type: ItemType;
+  readonly pricing_model: PricingModel;
+  readonly price: number;
+  readonly period: number;
+  readonly period_unit: PeriodUnit;
+  readonly free_quantity: number;
+  readonly currency_code: string;
+  readonly trial_period: number | null;
+  readonly trial_period_unit: PeriodUnit | null;
 }
 
 export interface ChargebeeSubscriptionItem {
-  item_price_id: string;
-  item_type: ItemType;
-  quantity: number;
-  unit_price: number;
-  amount: number;
-  free_quantity: number;
+  readonly item_price_id: string;
+  readonly item_type: ItemType;
+  readonly quantity: number;
+  readonly unit_price: number;
+  readonly amount: number;
+  readonly free_quantity: number;
 }
 
 export interface ChargebeeSubscription extends Entity, Timestamped {
-  chargebee_id: string;
-  customer_id: string;
-  currency_code: string;
-  status: SubscriptionStatus;
-  billing_period: number;
-  billing_period_unit: PeriodUnit;
-  items: ChargebeeSubscriptionItem[];
-  current_term_start: number | null;
-  current_term_end: number | null;
-  next_billing_at: number | null;
-  trial_start: number | null;
-  trial_end: number | null;
-  started_at: number;
-  activated_at: number | null;
-  cancelled_at: number | null;
-  cancel_reason: string | null;
-  due_invoices_count: number;
-  mrr: number;
+  readonly chargebee_id: string;
+  readonly customer_id: string;
+  readonly currency_code: string;
+  readonly status: SubscriptionStatus;
+  readonly billing_period: number;
+  readonly billing_period_unit: PeriodUnit;
+  readonly items: readonly ChargebeeSubscriptionItem[];
+  readonly current_term_start: number | null;
+  readonly current_term_end: number | null;
+  readonly next_billing_at: number | null;
+  readonly trial_start: number | null;
+  readonly trial_end: number | null;
+  readonly started_at: number;
+  readonly activated_at: number | null;
+  readonly cancelled_at: number | null;
+  readonly cancel_reason: string | null;
+  readonly due_invoices_count: number;
+  readonly mrr: number;
 }
 
 export interface ChargebeeLineItem {
-  id: string;
-  date_from: number;
-  date_to: number;
-  unit_amount: number;
-  quantity: number;
-  amount: number;
-  pricing_model: PricingModel;
-  description: string;
-  entity_id: string;
+  readonly id: string;
+  readonly date_from: number;
+  readonly date_to: number;
+  readonly unit_amount: number;
+  readonly quantity: number;
+  readonly amount: number;
+  readonly pricing_model: PricingModel;
+  readonly description: string;
+  readonly entity_id: string;
 }
 
 export interface ChargebeeInvoice extends Entity, Timestamped {
-  chargebee_id: string;
-  customer_id: string;
-  subscription_id: string | null;
-  status: InvoiceStatus;
-  date: number;
-  due_date: number;
-  net_term_days: number;
-  currency_code: string;
-  line_items: ChargebeeLineItem[];
-  sub_total: number;
-  total: number;
-  amount_paid: number;
-  amount_due: number;
-  first_invoice: boolean;
+  readonly chargebee_id: string;
+  readonly customer_id: string;
+  readonly subscription_id: string | null;
+  readonly status: InvoiceStatus;
+  readonly date: number;
+  readonly due_date: number;
+  readonly net_term_days: number;
+  readonly currency_code: string;
+  readonly line_items: readonly ChargebeeLineItem[];
+  readonly sub_total: number;
+  readonly total: number;
+  readonly amount_paid: number;
+  readonly amount_due: number;
+  readonly first_invoice: boolean;
 }
 
 export interface ChargebeeCard {
-  first_name: string | null;
-  last_name: string | null;
-  iin: string;
-  last4: string;
-  brand: string;
-  expiry_month: number;
-  expiry_year: number;
-  masked_number: string;
+  readonly first_name: string | null;
+  readonly last_name: string | null;
+  readonly iin: string;
+  readonly last4: string;
+  readonly brand: string;
+  readonly expiry_month: number;
+  readonly expiry_year: number;
+  readonly masked_number: string;
 }
 
 export interface ChargebeePaymentSource extends Entity, Timestamped {
-  chargebee_id: string;
-  customer_id: string;
-  status: "valid" | "expiring" | "expired" | "invalid";
-  reference_id: string;
-  card: ChargebeeCard | null;
+  readonly chargebee_id: string;
+  readonly customer_id: string;
+  readonly status: "valid" | "expiring" | "expired" | "invalid";
+  readonly reference_id: string;
+  readonly card: ChargebeeCard | null;
 }
 
 export interface ChargebeeEvent extends Entity, Timestamped {
-  chargebee_id: string;
-  occurred_at: number;
-  event_type: string;
-  content: Record<string, unknown>;
+  readonly chargebee_id: string;
+  readonly occurred_at: number;
+  readonly event_type: string;
+  readonly content: Record<string, unknown>;
 }

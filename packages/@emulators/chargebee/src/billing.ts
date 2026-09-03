@@ -26,7 +26,39 @@ import type { ChargebeeStore } from "./store.js";
  * It stays as a backstop because the alternative failure mode is an unbounded loop
  * writing invoices.
  */
-const MAX_TERMS_PER_RUN = 2000;
+export const MAX_TERMS_PER_RUN = 2000;
+
+/**
+ * How many terms the furthest-behind subscription would bill to reach `destination`.
+ *
+ * Pure arithmetic over a copy of the schedule: it writes nothing. Callers use it to
+ * refuse a jump before touching any state, so the guard inside runDueWork stays
+ * unreachable rather than tripping halfway through a batch of invoices. Counting
+ * stops at the cap because the only question is whether the limit is exceeded.
+ */
+export function countDueTerms(cs: ChargebeeStore, destination: number): number {
+  let worst = 0;
+
+  for (const subscription of cs.subscriptions.all()) {
+    if (subscription.status === "cancelled") continue;
+
+    let due = subscription.next_billing_at;
+    let terms = 0;
+    let cursor = subscription.current_term_end ?? due;
+
+    while (due !== null && due <= destination && terms <= MAX_TERMS_PER_RUN) {
+      terms += 1;
+      if (subscription.status === "non_renewing") break;
+      const from = cursor ?? due;
+      cursor = addPeriod(from, subscription.billing_period, subscription.billing_period_unit);
+      due = cursor;
+    }
+
+    worst = Math.max(worst, terms);
+  }
+
+  return worst;
+}
 
 export interface BillingContext {
   cs: ChargebeeStore;
@@ -305,6 +337,7 @@ async function activateTerm(
   start: number,
   first: boolean,
   eventType: "subscription_activated" | "subscription_renewed",
+  options: { precedingEvent?: "subscription_started" } = {},
 ): Promise<ChargebeeSubscription> {
   const { cs } = ctx;
   const termEnd = addPeriod(start, subscription.billing_period, subscription.billing_period_unit);
@@ -320,6 +353,10 @@ async function activateTerm(
 
   const invoice = generateInvoice(cs, updated, start, termEnd, first);
   const settled = cs.subscriptions.get(updated.id) ?? updated;
+
+  if (options.precedingEvent) {
+    await emit(ctx, options.precedingEvent, { subscription: formatSubscription(settled) });
+  }
 
   await emit(ctx, eventType, {
     subscription: formatSubscription(settled),
@@ -373,7 +410,16 @@ export async function runDueWork(ctx: BillingContext): Promise<void> {
           await emit(ctx, "subscription_started", { subscription: formatSubscription(subscription) });
           continue;
         }
-        subscription = await activateTerm(ctx, subscription, due, true, "subscription_activated");
+
+        // Without a trial the start and the activation happen together, but they are
+        // still two events: Chargebee sends subscription_started when a future-dated
+        // subscription reaches its start date, then subscription_activated for the
+        // move into active. Both carry the updated payload, so the start event is
+        // emitted after the transition rather than before, when the subscription
+        // would still read as "future".
+        subscription = await activateTerm(ctx, subscription, due, true, "subscription_activated", {
+          precedingEvent: "subscription_started",
+        });
         continue;
       }
 

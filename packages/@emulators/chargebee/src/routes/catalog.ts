@@ -5,6 +5,7 @@ import {
   asPeriodUnit,
   asPricingModel,
   badParam,
+  classifyPricingModel,
   chargebeeList,
   duplicate,
   fieldOf,
@@ -127,17 +128,24 @@ export function catalogRoutes({ app, store }: RouteContext): void {
     if (!item) return notFound(c, `Item [${itemId}] not found`);
 
     const rawPricingModel = readString(body, "pricing_model") ?? "per_unit";
-    const pricingModel = asPricingModel(rawPricingModel);
-    if (!pricingModel) {
-      // Tiered, volume and stairstep pricing are refused rather than approximated:
-      // the bracket arithmetic is not publicly specified and a wrong total here would
-      // surface as a passing test over a bad invoice.
+    const support = classifyPricingModel(rawPricingModel);
+    if (support === "unsupported") {
+      // A real Chargebee pricing model this emulator refuses rather than
+      // approximates: the bracket arithmetic is not publicly specified and a wrong
+      // total here would surface as a passing test over a bad invoice.
       return notEmulated(
         c,
         `pricing_model=${rawPricingModel}`,
-        "only per_unit and flat_fee are emulated; tiered and volume pricing arithmetic is not reproduced",
+        "only per_unit and flat_fee are emulated; tiered, volume and stairstep pricing arithmetic is not reproduced",
       );
     }
+    if (support === "unknown") {
+      // Not a Chargebee pricing model at all, so this is a bad parameter rather
+      // than a gap in the emulator, and the real API answers 400 here too.
+      throw badParam("pricing_model", `Unknown pricing model: ${rawPricingModel}`);
+    }
+    const pricingModel = asPricingModel(rawPricingModel);
+    if (!pricingModel) throw badParam("pricing_model", `Unknown pricing model: ${rawPricingModel}`);
 
     const rawPeriodUnit = readString(body, "period_unit") ?? "month";
     const periodUnit = asPeriodUnit(rawPeriodUnit);
@@ -150,12 +158,16 @@ export function catalogRoutes({ app, store }: RouteContext): void {
       throw badParam("period", `period must be a positive integer, received ${period}`);
     }
 
+    // Money is in the currency's minor unit and quantities are counts, so both are
+    // integers. A fractional value would otherwise reach invoice arithmetic.
     const price = readNumber(body, "price") ?? 0;
-    if (price < 0) throw badParam("price", `price may not be negative, received ${price}`);
+    if (!Number.isInteger(price) || price < 0) {
+      throw badParam("price", `price must be a non-negative integer, received ${price}`);
+    }
 
     const freeQuantity = readNumber(body, "free_quantity") ?? 0;
-    if (freeQuantity < 0) {
-      throw badParam("free_quantity", `free_quantity may not be negative, received ${freeQuantity}`);
+    if (!Number.isInteger(freeQuantity) || freeQuantity < 0) {
+      throw badParam("free_quantity", `free_quantity must be a non-negative integer, received ${freeQuantity}`);
     }
 
     const trialPeriod = readNumber(body, "trial_period");

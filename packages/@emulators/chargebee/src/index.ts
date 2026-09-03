@@ -19,6 +19,7 @@ import {
   DEFAULT_EPOCH,
   decodeBasicAuth,
   requestErrorResponse,
+  seedEnum,
   setNow,
 } from "./helpers.js";
 import { catalogRoutes } from "./routes/catalog.js";
@@ -218,7 +219,7 @@ export function seedFromConfig(
       chargebee_id: item.id,
       name: item.name ?? item.id,
       external_name: null,
-      type: asItemType(item.type) ?? "plan",
+      type: seedEnum(asItemType(item.type), item.type, `item [${item.id}] type`) ?? "plan",
       item_family_id: familyId,
       metered: false,
       created: at,
@@ -246,14 +247,22 @@ export function seedFromConfig(
       item_family_id: item.item_family_id,
       item_id: item.chargebee_id,
       item_type: item.type,
-      pricing_model: asPricingModel(price.pricing_model) ?? "per_unit",
+      pricing_model:
+        seedEnum(asPricingModel(price.pricing_model), price.pricing_model, `item price [${price.id}] pricing_model`) ??
+        "per_unit",
       price: price.price,
       period,
-      period_unit: asPeriodUnit(price.period_unit) ?? "month",
+      period_unit:
+        seedEnum(asPeriodUnit(price.period_unit), price.period_unit, `item price [${price.id}] period_unit`) ?? "month",
       free_quantity: price.free_quantity ?? 0,
       currency_code: price.currency_code ?? "USD",
       trial_period: price.trial_period ?? null,
-      trial_period_unit: asPeriodUnit(price.trial_period_unit) ?? null,
+      trial_period_unit:
+        seedEnum(
+          asPeriodUnit(price.trial_period_unit),
+          price.trial_period_unit,
+          `item price [${price.id}] trial_period_unit`,
+        ) ?? null,
       created: at,
       updated: at,
     });

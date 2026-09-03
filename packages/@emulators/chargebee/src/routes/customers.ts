@@ -1,5 +1,5 @@
 import type { Context, RouteContext } from "@emulators/core";
-import type { ChargebeeBillingAddress, ChargebeeCustomer } from "../entities.js";
+import type { ChargebeeBillingAddress, ChargebeeCustomer, Draft } from "../entities.js";
 import { formatCustomer } from "../formatters.js";
 import {
   badParam,
@@ -59,13 +59,18 @@ function metaDataFrom(body: Record<string, unknown>): Record<string, unknown> | 
 }
 
 /**
- * Build a partial update from a request body.
+ * Build a partial update of a customer's standard attributes.
  *
  * Chargebee leaves absent fields untouched rather than clearing them, so only keys
  * actually present in the request appear in the patch.
+ *
+ * Deliberately excludes the billing address. Chargebee splits its two endpoints:
+ * standard attributes belong to the customer-update API and the billing address to
+ * the billing-information API. Sharing one builder let each endpoint write the
+ * other's fields, so a call to update_billing_info could change an email address.
  */
-function customerPatch(body: Record<string, unknown>, at: number): Partial<ChargebeeCustomer> {
-  const patch: Partial<ChargebeeCustomer> = { updated: at };
+function customerPatch(body: Record<string, unknown>, at: number): Draft<ChargebeeCustomer> {
+  const patch: Draft<ChargebeeCustomer> = { updated: at };
 
   const strings: Array<[keyof ChargebeeCustomer, string | undefined]> = [
     ["first_name", readString(body, "first_name")],
@@ -96,9 +101,6 @@ function customerPatch(body: Record<string, unknown>, at: number): Partial<Charg
   const currency = readString(body, "preferred_currency_code");
   if (currency !== undefined) patch.preferred_currency_code = currency;
 
-  const address = billingAddressFrom(body);
-  if (address !== undefined) patch.billing_address = address;
-
   const metaData = metaDataFrom(body);
   if (metaData !== undefined) patch.meta_data = metaData;
 
@@ -108,6 +110,19 @@ function customerPatch(body: Record<string, unknown>, at: number): Partial<Charg
   }
   if (Object.keys(custom).length > 0) patch.cf_fields = custom;
 
+  return patch;
+}
+
+/**
+ * Build a partial update of a customer's billing information.
+ *
+ * The billing-information endpoint owns the billing address and nothing else, so
+ * this refuses to carry standard attributes even if a caller sends them.
+ */
+function billingInfoPatch(body: Record<string, unknown>, at: number): Draft<ChargebeeCustomer> {
+  const patch: Draft<ChargebeeCustomer> = { updated: at };
+  const address = billingAddressFrom(body);
+  if (address !== undefined) patch.billing_address = address;
   return patch;
 }
 
@@ -123,7 +138,9 @@ export function customerRoutes({ app, store, webhooks }: RouteContext): void {
     }
 
     const at = now(cs);
-    const patch = customerPatch(body, at);
+    // Creation is the one endpoint that legitimately accepts both: Chargebee's
+    // create-customer API takes standard attributes and a billing address together.
+    const patch = { ...customerPatch(body, at), ...billingInfoPatch(body, at) };
 
     const customer = cs.customers.insert({
       chargebee_id: requestedId ?? chargebeeId("cus"),
@@ -162,12 +179,22 @@ export function customerRoutes({ app, store, webhooks }: RouteContext): void {
     return c.json({ customer: formatCustomer(customer) });
   });
 
-  const update = async (c: Context) => {
+  /**
+   * Apply a patch and announce the change.
+   *
+   * The two update endpoints share only this plumbing. Which fields each one is
+   * allowed to touch is decided by the patch builder passed in, so neither can
+   * write the other's.
+   */
+  const applyUpdate = async (
+    c: Context,
+    build: (body: Record<string, unknown>, at: number) => Draft<ChargebeeCustomer>,
+  ) => {
     const customer = cs.customers.findOneBy("chargebee_id", c.req.param("id"));
     if (!customer) return notFound(c);
 
     const body = await parseChargebeeBody(c);
-    const updated = cs.customers.update(customer.id, customerPatch(body, now(cs)));
+    const updated = cs.customers.update(customer.id, build(body, now(cs)));
     if (!updated) return notFound(c);
 
     await webhooks.dispatch(
@@ -180,8 +207,8 @@ export function customerRoutes({ app, store, webhooks }: RouteContext): void {
     return c.json({ customer: formatCustomer(updated) });
   };
 
-  app.post("/api/v2/customers/:id", update);
-  app.post("/api/v2/customers/:id/update_billing_info", update);
+  app.post("/api/v2/customers/:id", (c) => applyUpdate(c, customerPatch));
+  app.post("/api/v2/customers/:id/update_billing_info", (c) => applyUpdate(c, billingInfoPatch));
 
   app.get("/api/v2/customers", (c) => {
     const filters = readFilters(c, ["id", "email", "company", "created_at"]);

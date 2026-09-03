@@ -800,3 +800,225 @@ describe("change_term_end bounds", () => {
     expect(ok.body.subscription.current_term_end).toBe(DEFAULT_EPOCH + 45 * 86400);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round-two review findings. Same rule as above: a test per finding that fails
+// against the previous implementation.
+// ---------------------------------------------------------------------------
+
+describe("time travel is all or nothing", () => {
+  it("refuses a jump too large to bill instead of applying it partially", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const created = await post(app, "/api/v2/customers/cus_acme/subscription_for_items", subscribe());
+    expect(created.status).toBe(200);
+
+    const invoicesBefore = (await get(app, "/api/v2/invoices?limit=100")).body.list.length;
+
+    // Two hundred years of monthly terms is far beyond the internal guard.
+    const response = await post(app, "/api/v2/time_machines/default/travel_forward", {
+      destination_time: DEFAULT_EPOCH + 200 * 365 * 86400,
+    });
+    expect(response.status).toBe(400);
+    expect(response.body.param).toBe("destination_time");
+    expect(response.body.message).toContain("smaller steps");
+
+    // Nothing moved: not the clock, not the invoices.
+    const machine = await get(app, "/api/v2/time_machines/default");
+    expect(machine.body.time_machine.destination_time).toBe(DEFAULT_EPOCH);
+    expect((await get(app, "/api/v2/invoices?limit=100")).body.list.length).toBe(invoicesBefore);
+  });
+
+  it("leaves no partial state behind, so a rejected jump can be retried in steps", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    await post(app, "/api/v2/customers/cus_acme/subscription_for_items", subscribe());
+
+    await post(app, "/api/v2/time_machines/default/travel_forward", {
+      destination_time: DEFAULT_EPOCH + 500 * 365 * 86400,
+    });
+
+    // A jump within the limit still works afterwards and bills exactly one year.
+    const ok = await post(app, "/api/v2/time_machines/default/travel_forward", {
+      destination_time: DEFAULT_EPOCH + 365 * 86400,
+    });
+    expect(ok.status).toBe(200);
+    expect((await get(app, "/api/v2/invoices?limit=100")).body.list).toHaveLength(13);
+  });
+
+  it("still allows a large jump for a plan whose terms are long enough", async () => {
+    const seed = catalogSeed();
+    seed.item_prices = [
+      { id: "pro-yearly", item: "pro", name: "Pro Yearly", price: 30000, period: 1, period_unit: "year" },
+    ];
+    const { app } = createChargebeeTestApp(seed);
+
+    const created = await post(app, "/api/v2/customers/cus_acme/subscription_for_items", {
+      "subscription_items[item_price_id][0]": "pro-yearly",
+    });
+    expect(created.status).toBe(200);
+
+    const response = await post(app, "/api/v2/time_machines/default/travel_forward", {
+      destination_time: DEFAULT_EPOCH + 20 * 365 * 86400,
+    });
+    expect(response.status).toBe(200);
+    expect((await get(app, "/api/v2/invoices?limit=100")).body.list.length).toBeGreaterThan(15);
+  });
+});
+
+describe("customer update contracts are separate", () => {
+  it("update_billing_info changes only the billing address", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+
+    const response = await post(app, "/api/v2/customers/cus_acme/update_billing_info", {
+      "billing_address[line1]": "1 Test Street",
+      "billing_address[city]": "Testville",
+      // These belong to the customer-update endpoint and must be ignored here.
+      email: "hijack@evil.example",
+      company: "Hijacked",
+      auto_collection: "off",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.customer.billing_address).toMatchObject({ line1: "1 Test Street", city: "Testville" });
+    expect(response.body.customer.email).toBe("billing@acme.example");
+    expect(response.body.customer.company).toBe("Acme");
+    expect(response.body.customer.auto_collection).toBe("on");
+  });
+
+  it("a plain customer update leaves the billing address alone", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    await post(app, "/api/v2/customers/cus_acme/update_billing_info", {
+      "billing_address[line1]": "1 Test Street",
+    });
+
+    const response = await post(app, "/api/v2/customers/cus_acme", {
+      first_name: "Ada",
+      "billing_address[line1]": "2 Hijack Road",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.customer.first_name).toBe("Ada");
+    expect(response.body.customer.billing_address.line1).toBe("1 Test Street");
+  });
+
+  it("still accepts both on creation, as the real API does", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const response = await post(app, "/api/v2/customers", {
+      id: "cus_both",
+      email: "both@acme.example",
+      "billing_address[line1]": "3 Creation Way",
+    });
+    expect(response.status).toBe(200);
+    expect(response.body.customer.email).toBe("both@acme.example");
+    expect(response.body.customer.billing_address.line1).toBe("3 Creation Way");
+  });
+});
+
+describe("future subscription events", () => {
+  it("emits subscription_started before subscription_activated, with the updated payload", async () => {
+    const delivered: any[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        delivered.push(JSON.parse(init.body));
+        return new Response("{}", { status: 200 });
+      }),
+    );
+
+    const seed = catalogSeed();
+    seed.webhooks = [{ url: "http://localhost:9999/hooks", events: ["*"] }];
+    const { app } = createChargebeeTestApp(seed);
+
+    const startDate = DEFAULT_EPOCH + 10 * 86400;
+    await post(app, "/api/v2/customers/cus_acme/subscription_for_items", {
+      ...subscribe(),
+      start_date: startDate,
+    });
+
+    delivered.length = 0;
+    await post(app, "/api/v2/time_machines/default/travel_forward", { destination_time: startDate });
+
+    const types = delivered.map((event) => event.event_type);
+    expect(types).toContain("subscription_started");
+    expect(types).toContain("subscription_activated");
+    expect(types.indexOf("subscription_started")).toBeLessThan(types.indexOf("subscription_activated"));
+
+    // The start event must not still describe the subscription as future.
+    const started = delivered.find((event) => event.event_type === "subscription_started");
+    expect(started.content.subscription.status).toBe("active");
+  });
+});
+
+describe("catalog validation is precise about why it refuses", () => {
+  it("returns 400 for a misspelled pricing model and 501 only for real unsupported ones", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+
+    const typo = await post(app, "/api/v2/item_prices", {
+      id: "typo-plan",
+      item_id: "pro",
+      price: 1000,
+      pricing_model: "per_unt",
+    });
+    expect(typo.status).toBe(400);
+    expect(typo.body.api_error_code).toBe("param_wrong_value");
+    expect(typo.body.param).toBe("pricing_model");
+
+    for (const model of ["tiered", "volume", "stairstep"]) {
+      const real = await post(app, "/api/v2/item_prices", {
+        id: `real-${model}`,
+        item_id: "pro",
+        price: 1000,
+        pricing_model: model,
+      });
+      expect(real.status, model).toBe(501);
+      expect(real.body.api_error_code, model).toBe("not_emulated");
+    }
+  });
+
+  it("requires price and free_quantity to be integers", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+
+    const fractionalPrice = await post(app, "/api/v2/item_prices", {
+      id: "frac-price",
+      item_id: "pro",
+      price: 10.5,
+    });
+    expect(fractionalPrice.status).toBe(400);
+    expect(fractionalPrice.body.param).toBe("price");
+
+    const fractionalFree = await post(app, "/api/v2/item_prices", {
+      id: "frac-free",
+      item_id: "pro",
+      price: 1000,
+      free_quantity: 1.5,
+    });
+    expect(fractionalFree.status).toBe(400);
+    expect(fractionalFree.body.param).toBe("free_quantity");
+  });
+});
+
+describe("seed configuration", () => {
+  it("rejects an unknown enum value instead of quietly defaulting it", () => {
+    const seed = catalogSeed();
+    // A seed asking for fortnightly billing used to produce monthly billing with
+    // no signal, while the same value over HTTP was rejected.
+    seed.item_prices = [
+      { id: "odd", item: "pro", name: "Odd", price: 1000, period: 1, period_unit: "fortnight" as never },
+    ];
+    expect(() => createChargebeeTestApp(seed)).toThrow(/period_unit/);
+
+    const badType = catalogSeed();
+    badType.items = [{ id: "weird", name: "Weird", type: "bundle" as never, item_family: "acme" }];
+    expect(() => createChargebeeTestApp(badType)).toThrow(/type/);
+
+    const badModel = catalogSeed();
+    badModel.item_prices = [{ id: "odd2", item: "pro", name: "Odd", price: 1000, pricing_model: "tiered" as never }];
+    expect(() => createChargebeeTestApp(badModel)).toThrow(/pricing_model/);
+  });
+
+  it("accepts a valid seed unchanged", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const price = await get(app, "/api/v2/item_prices/pro-monthly");
+    expect(price.body.item_price.period_unit).toBe("month");
+    expect(price.body.item_price.pricing_model).toBe("per_unit");
+  });
+});

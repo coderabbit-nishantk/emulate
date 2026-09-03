@@ -199,12 +199,9 @@ export function decodeBasicAuth(c: Context): { username: string; password: strin
   const encoded = header.slice(6).trim();
   if (!encoded) return null;
 
-  let decoded: string;
-  try {
-    decoded = Buffer.from(encoded, "base64").toString("utf8");
-  } catch {
-    return null;
-  }
+  // Buffer.from does not throw on malformed base64, it discards what it cannot
+  // decode, so there is nothing here to catch.
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
 
   const separator = decoded.indexOf(":");
   if (separator === -1) return { username: decoded, password: "" };
@@ -233,6 +230,40 @@ export function asPeriodUnit(value: string | undefined): PeriodUnit | undefined 
 
 export function asPricingModel(value: string | undefined): PricingModel | undefined {
   return PRICING_MODELS.find((candidate) => candidate === value);
+}
+
+/**
+ * Chargebee pricing models this emulator does not reproduce.
+ *
+ * Kept separate from unrecognised values so the two get different errors. A real
+ * model the emulator refuses is a 501; a typo is a 400, which is what the real API
+ * returns. Answering "not emulated" to `per_unt` would send someone hunting for a
+ * missing feature instead of a misspelling.
+ */
+const UNSUPPORTED_PRICING_MODELS: readonly string[] = ["tiered", "volume", "stairstep"];
+
+export type PricingModelSupport = "supported" | "unsupported" | "unknown";
+
+export function classifyPricingModel(value: string): PricingModelSupport {
+  if (asPricingModel(value)) return "supported";
+  if (UNSUPPORTED_PRICING_MODELS.includes(value)) return "unsupported";
+  return "unknown";
+}
+
+/**
+ * Validate an enum value coming from seed configuration.
+ *
+ * Seeding used to fall back to a default when it could not recognise a value, so a
+ * seed saying `period_unit: fortnight` produced monthly billing with no signal,
+ * while the same value over HTTP was rejected. A seed file is a precondition the
+ * whole run depends on, so a typo in one should stop startup rather than quietly
+ * change what is being tested.
+ */
+export function seedEnum<T>(normalized: T | undefined, raw: string | undefined, label: string): T | undefined {
+  if (raw !== undefined && normalized === undefined) {
+    throw new Error(`chargebee seed: ${label} has an unknown value (${raw})`);
+  }
+  return normalized;
 }
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
