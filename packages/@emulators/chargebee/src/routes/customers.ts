@@ -2,10 +2,12 @@ import type { Context, RouteContext } from "@emulators/core";
 import type { ChargebeeBillingAddress, ChargebeeCustomer } from "../entities.js";
 import { formatCustomer } from "../formatters.js";
 import {
-  chargebeeError,
+  badParam,
   chargebeeId,
   chargebeeList,
+  duplicate,
   fieldOf,
+  isPlainObject,
   matchesFilters,
   notFound,
   now,
@@ -34,6 +36,29 @@ function billingAddressFrom(body: Record<string, unknown>): ChargebeeBillingAddr
 }
 
 /**
+ * Parse `meta_data`, which arrives as a JSON string.
+ *
+ * Validated rather than asserted: `JSON.parse` returns `any`, so an assertion would
+ * let an array or a scalar through to be stored and then handed to `Object.keys`
+ * in the formatter, putting a malformed `meta_data` in the response.
+ */
+function metaDataFrom(body: Record<string, unknown>): Record<string, unknown> | undefined {
+  const raw = readString(body, "meta_data");
+  if (raw === undefined) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw badParam("meta_data", "meta_data must be valid JSON");
+  }
+  if (!isPlainObject(parsed)) {
+    throw badParam("meta_data", "meta_data must be a JSON object");
+  }
+  return parsed;
+}
+
+/**
  * Build a partial update from a request body.
  *
  * Chargebee leaves absent fields untouched rather than clearing them, so only keys
@@ -50,15 +75,23 @@ function customerPatch(body: Record<string, unknown>, at: number): Partial<Charg
     ["phone", readString(body, "phone")],
     ["locale", readString(body, "locale")],
   ];
-  for (const [field, value] of strings) {
-    if (value !== undefined) Object.assign(patch, { [field]: value });
+  for (const [key, value] of strings) {
+    if (value !== undefined) Object.assign(patch, { [key]: value });
   }
 
   const autoCollection = readString(body, "auto_collection");
   if (autoCollection === "on" || autoCollection === "off") patch.auto_collection = autoCollection;
+  else if (autoCollection !== undefined) {
+    throw badParam("auto_collection", `auto_collection must be on or off, received ${autoCollection}`);
+  }
 
   const netTermDays = readNumber(body, "net_term_days");
-  if (netTermDays !== undefined) patch.net_term_days = netTermDays;
+  if (netTermDays !== undefined) {
+    if (!Number.isInteger(netTermDays) || netTermDays < 0) {
+      throw badParam("net_term_days", `net_term_days must be a non-negative integer, received ${netTermDays}`);
+    }
+    patch.net_term_days = netTermDays;
+  }
 
   const currency = readString(body, "preferred_currency_code");
   if (currency !== undefined) patch.preferred_currency_code = currency;
@@ -66,14 +99,8 @@ function customerPatch(body: Record<string, unknown>, at: number): Partial<Charg
   const address = billingAddressFrom(body);
   if (address !== undefined) patch.billing_address = address;
 
-  const metaData = readString(body, "meta_data");
-  if (metaData !== undefined) {
-    try {
-      patch.meta_data = JSON.parse(metaData) as Record<string, unknown>;
-    } catch {
-      throw new Error("meta_data must be valid JSON");
-    }
-  }
+  const metaData = metaDataFrom(body);
+  if (metaData !== undefined) patch.meta_data = metaData;
 
   const custom: Record<string, string> = {};
   for (const [key, value] of Object.entries(body)) {
@@ -92,23 +119,11 @@ export function customerRoutes({ app, store, webhooks }: RouteContext): void {
     const requestedId = readString(body, "id");
 
     if (requestedId && cs.customers.findOneBy("chargebee_id", requestedId)) {
-      return chargebeeError(c, 409, "duplicate_entry", `Customer with id [${requestedId}] already exists`);
+      return duplicate(c, `Customer with id [${requestedId}] already exists`);
     }
 
     const at = now(cs);
-    let patch: Partial<ChargebeeCustomer>;
-    try {
-      patch = customerPatch(body, at);
-    } catch {
-      return chargebeeError(
-        c,
-        400,
-        "param_wrong_value",
-        "meta_data must be valid JSON",
-        "invalid_request",
-        "meta_data",
-      );
-    }
+    const patch = customerPatch(body, at);
 
     const customer = cs.customers.insert({
       chargebee_id: requestedId ?? chargebeeId("cus"),
@@ -152,21 +167,7 @@ export function customerRoutes({ app, store, webhooks }: RouteContext): void {
     if (!customer) return notFound(c);
 
     const body = await parseChargebeeBody(c);
-    let patch: Partial<ChargebeeCustomer>;
-    try {
-      patch = customerPatch(body, now(cs));
-    } catch {
-      return chargebeeError(
-        c,
-        400,
-        "param_wrong_value",
-        "meta_data must be valid JSON",
-        "invalid_request",
-        "meta_data",
-      );
-    }
-
-    const updated = cs.customers.update(customer.id, patch);
+    const updated = cs.customers.update(customer.id, customerPatch(body, now(cs)));
     if (!updated) return notFound(c);
 
     await webhooks.dispatch(

@@ -1,4 +1,4 @@
-import type { Context, WebhookDispatcher } from "@emulators/core";
+import type { WebhookDispatcher } from "@emulators/core";
 import type {
   ChargebeeInvoice,
   ChargebeeItemPrice,
@@ -6,46 +6,27 @@ import type {
   ChargebeeSubscription,
   ChargebeeSubscriptionItem,
 } from "./entities.js";
-import { formatCustomer, formatInvoice, formatSubscription } from "./formatters.js";
-import { addPeriod, chargebeeError, chargebeeId, monthsInPeriod, nextInvoiceNumber, now } from "./helpers.js";
+import { formatCustomer, formatEvent, formatInvoice, formatSubscription } from "./formatters.js";
+import {
+  addPeriod,
+  badParam,
+  chargebeeId,
+  missingParam,
+  monthsInPeriod,
+  nextInvoiceNumber,
+  now,
+  RequestError,
+} from "./helpers.js";
 import type { ChargebeeStore } from "./store.js";
 
-/** Guards against a malformed billing period turning a time jump into a hang. */
-const MAX_TERMS_PER_RUN = 2000;
-
 /**
- * A failure that a route turns into a Chargebee-shaped error response.
+ * Guards against a malformed billing period turning a time jump into a hang.
  *
- * Billing logic lives away from HTTP so it can be reasoned about and tested on its
- * own, so it raises this instead of building a response.
+ * Item price creation rejects a non-positive period, so this should be unreachable.
+ * It stays as a backstop because the alternative failure mode is an unbounded loop
+ * writing invoices.
  */
-export class BillingError extends Error {
-  constructor(
-    public status: number,
-    public apiErrorCode: string,
-    message: string,
-    public param?: string,
-  ) {
-    super(message);
-    this.name = "BillingError";
-  }
-}
-
-/**
- * Turn a BillingError into a Chargebee-shaped response, or return null when the
- * failure is something else and should keep propagating.
- */
-export function billingErrorResponse(c: Context, error: unknown): Response | null {
-  if (!(error instanceof BillingError)) return null;
-  return chargebeeError(
-    c,
-    error.status,
-    error.apiErrorCode,
-    error.message,
-    error.status >= 500 ? "operation_failed" : "invalid_request",
-    error.param,
-  ) as unknown as Response;
-}
+const MAX_TERMS_PER_RUN = 2000;
 
 export interface BillingContext {
   cs: ChargebeeStore;
@@ -58,9 +39,16 @@ export interface RequestedItem {
   unitPrice?: number;
 }
 
+/**
+ * Record an event and deliver it.
+ *
+ * The stored row and the webhook payload carry the same id and the same shape. A
+ * consumer that reads `id` from a delivery and calls `GET /api/v2/events/:id` has
+ * to find that event, which is what the real API guarantees.
+ */
 async function emit(ctx: BillingContext, eventType: string, content: Record<string, unknown>): Promise<void> {
   const at = now(ctx.cs);
-  ctx.cs.events.insert({
+  const event = ctx.cs.events.insert({
     chargebee_id: chargebeeId("ev"),
     occurred_at: at,
     event_type: eventType,
@@ -68,18 +56,20 @@ async function emit(ctx: BillingContext, eventType: string, content: Record<stri
     created: at,
     updated: at,
   });
-  await ctx.webhooks.dispatch(
-    eventType,
-    undefined,
-    { id: chargebeeId("ev"), event_type: eventType, content },
-    "chargebee",
-  );
+
+  await ctx.webhooks.dispatch(eventType, undefined, formatEvent(event), "chargebee");
 }
 
 export function itemPriceOrThrow(cs: ChargebeeStore, id: string): ChargebeeItemPrice {
   const price = cs.itemPrices.findOneBy("chargebee_id", id);
   if (!price) {
-    throw new BillingError(404, "resource_not_found", `Item price [${id}] not found`, "item_price_id");
+    throw new RequestError(
+      404,
+      "resource_not_found",
+      `Item price [${id}] not found`,
+      "invalid_request",
+      "item_price_id",
+    );
   }
   return price;
 }
@@ -104,7 +94,7 @@ export function buildItems(
   requested: readonly RequestedItem[],
 ): { items: ChargebeeSubscriptionItem[]; plan: ChargebeeItemPrice } {
   if (requested.length === 0) {
-    throw new BillingError(400, "param_required", "subscription_items is required", "subscription_items");
+    throw missingParam("subscription_items");
   }
 
   const items: ChargebeeSubscriptionItem[] = [];
@@ -127,12 +117,16 @@ export function buildItems(
 
   const plan = plans[0];
   if (plans.length !== 1 || !plan) {
-    throw new BillingError(
-      400,
-      "param_wrong_value",
-      `A subscription requires exactly one plan item price, received ${plans.length}`,
+    throw badParam(
       "subscription_items",
+      `A subscription requires exactly one plan item price, received ${plans.length}`,
     );
+  }
+
+  // Belt and braces with the item price validation: a zero or negative period would
+  // leave next_billing_at permanently due and make runDueWork loop.
+  if (plan.period <= 0) {
+    throw badParam("subscription_items", `Plan [${plan.chargebee_id}] has a non-positive billing period`);
   }
 
   return { items, plan };
@@ -221,18 +215,22 @@ export function materializeSubscription(
   const at = now(cs);
   const { items, plan } = buildItems(cs, input.items);
 
+  const future = input.startDate !== undefined && input.startDate > at;
+  // A trial on a future-dated subscription runs from the start date, not from now,
+  // so the customer gets the full trial rather than a shortened one.
+  const trialBase = future && input.startDate !== undefined ? input.startDate : at;
   const trialEnd =
     input.trialEnd ??
     (plan.trial_period !== null && plan.trial_period > 0
-      ? addPeriod(at, plan.trial_period, plan.trial_period_unit ?? "day")
+      ? addPeriod(trialBase, plan.trial_period, plan.trial_period_unit ?? "day")
       : undefined);
-  const future = input.startDate !== undefined && input.startDate > at;
+  const hasTrial = trialEnd !== undefined && trialEnd > trialBase;
 
   let created = cs.subscriptions.insert({
     chargebee_id: chargebeeId("sub"),
     customer_id: input.customerId,
     currency_code: plan.currency_code,
-    status: future ? "future" : trialEnd !== undefined ? "in_trial" : "active",
+    status: future ? "future" : hasTrial ? "in_trial" : "active",
     billing_period: plan.period,
     billing_period_unit: plan.period_unit,
     items,
@@ -254,8 +252,15 @@ export function materializeSubscription(
   let invoice: ChargebeeInvoice | undefined;
 
   if (future) {
-    created = cs.subscriptions.update(created.id, { next_billing_at: input.startDate ?? at }) ?? created;
-  } else if (trialEnd !== undefined) {
+    // The trial is recorded now and honoured when the start date arrives. Without
+    // this the future branch would bill at the start date and the trial would be
+    // silently dropped.
+    created =
+      cs.subscriptions.update(created.id, {
+        next_billing_at: input.startDate ?? at,
+        ...(hasTrial ? { trial_start: trialBase, trial_end: trialEnd } : {}),
+      }) ?? created;
+  } else if (hasTrial) {
     created =
       cs.subscriptions.update(created.id, { trial_start: at, trial_end: trialEnd, next_billing_at: trialEnd }) ??
       created;
@@ -344,10 +349,11 @@ export async function runDueWork(ctx: BillingContext): Promise<void> {
     for (;;) {
       guard += 1;
       if (guard > MAX_TERMS_PER_RUN) {
-        throw new BillingError(
+        throw new RequestError(
           500,
           "internal_error",
-          `Subscription ${subscription.chargebee_id} did not settle within ${MAX_TERMS_PER_RUN} terms; check its billing period`,
+          `Subscription ${subscription.chargebee_id} did not settle within ${MAX_TERMS_PER_RUN} terms`,
+          "operation_failed",
         );
       }
 
@@ -355,9 +361,22 @@ export async function runDueWork(ctx: BillingContext): Promise<void> {
       if (due === null || due > at) break;
 
       if (subscription.status === "future") {
+        // A future subscription with a trial enters the trial at its start date
+        // rather than being billed immediately.
+        if (subscription.trial_end !== null && subscription.trial_end > due) {
+          subscription =
+            cs.subscriptions.update(subscription.id, {
+              status: "in_trial",
+              next_billing_at: subscription.trial_end,
+              updated: at,
+            }) ?? subscription;
+          await emit(ctx, "subscription_started", { subscription: formatSubscription(subscription) });
+          continue;
+        }
         subscription = await activateTerm(ctx, subscription, due, true, "subscription_activated");
         continue;
       }
+
       if (subscription.status === "in_trial") {
         subscription = await activateTerm(
           ctx,
@@ -368,6 +387,7 @@ export async function runDueWork(ctx: BillingContext): Promise<void> {
         );
         continue;
       }
+
       if (subscription.status === "active") {
         subscription = await activateTerm(
           ctx,
@@ -378,6 +398,7 @@ export async function runDueWork(ctx: BillingContext): Promise<void> {
         );
         continue;
       }
+
       if (subscription.status === "non_renewing") {
         const ended =
           cs.subscriptions.update(subscription.id, {
@@ -389,6 +410,7 @@ export async function runDueWork(ctx: BillingContext): Promise<void> {
         await emit(ctx, "subscription_cancelled", { subscription: formatSubscription(ended) });
         break;
       }
+
       break;
     }
   }
@@ -402,7 +424,7 @@ export async function cancelSubscription(
 ): Promise<ChargebeeSubscription> {
   const { cs } = ctx;
   if (subscription.status === "cancelled") {
-    throw new BillingError(409, "invalid_state_for_request", "Subscription is already cancelled");
+    throw new RequestError(409, "invalid_state_for_request", "Subscription is already cancelled");
   }
 
   const at = now(cs);
@@ -438,7 +460,7 @@ export async function reactivateSubscription(
   }
 
   if (subscription.status !== "cancelled") {
-    throw new BillingError(
+    throw new RequestError(
       409,
       "invalid_state_for_request",
       `Only a cancelled or non-renewing subscription can be reactivated, this one is ${subscription.status}`,
@@ -485,7 +507,7 @@ export async function updateSubscriptionItems(
 ): Promise<ChargebeeSubscription> {
   const { cs } = ctx;
   if (subscription.status === "cancelled") {
-    throw new BillingError(409, "invalid_state_for_request", "Cannot update a cancelled subscription");
+    throw new RequestError(409, "invalid_state_for_request", "Cannot update a cancelled subscription");
   }
 
   const { items, plan } = buildItems(cs, requested);

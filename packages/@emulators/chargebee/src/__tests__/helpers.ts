@@ -1,3 +1,4 @@
+import type { AppEnv } from "@emulators/core";
 import { Hono, Store, WebhookDispatcher, createApiErrorHandler, createErrorHandler } from "@emulators/core";
 import { chargebeePlugin, seedFromConfig, type ChargebeeSeedConfig } from "../index.js";
 
@@ -7,19 +8,26 @@ export const BASE = "http://localhost:14100";
 export const AUTH = `Basic ${Buffer.from("cb_test_key:").toString("base64")}`;
 
 export interface TestApp {
-  app: Hono;
+  app: Hono<AppEnv>;
   store: Store;
   webhooks: WebhookDispatcher;
+}
+
+export interface Result {
+  status: number;
+  // Responses are untyped JSON here on purpose: these tests assert on the wire
+  // shape rather than on the emulator's internal types.
+  body: any;
 }
 
 export function createChargebeeTestApp(seed?: ChargebeeSeedConfig): TestApp {
   const store = new Store();
   const webhooks = new WebhookDispatcher();
 
-  const app = new Hono();
+  const app = new Hono<AppEnv>();
   app.onError(createApiErrorHandler());
   app.use("*", createErrorHandler());
-  chargebeePlugin.register(app as never, store, webhooks, BASE);
+  chargebeePlugin.register(app, store, webhooks, BASE);
 
   if (seed) {
     seedFromConfig(store, BASE, seed, webhooks);
@@ -37,22 +45,37 @@ export function form(params: Record<string, string | number | undefined>): strin
     .join("&");
 }
 
-export async function post(
-  app: Hono,
-  path: string,
-  params: Record<string, string | number | undefined> = {},
-): Promise<{ status: number; body: any }> {
-  const response = await app.request(path, {
-    method: "POST",
-    headers: { Authorization: AUTH, "Content-Type": "application/x-www-form-urlencoded" },
-    body: form(params),
-  });
+async function result(response: Response): Promise<Result> {
   return { status: response.status, body: await response.json() };
 }
 
-export async function get(app: Hono, path: string): Promise<{ status: number; body: any }> {
-  const response = await app.request(path, { headers: { Authorization: AUTH } });
-  return { status: response.status, body: await response.json() };
+export async function post(
+  app: Hono<AppEnv>,
+  path: string,
+  params: Record<string, string | number | undefined> = {},
+): Promise<Result> {
+  return result(
+    await app.request(path, {
+      method: "POST",
+      headers: { Authorization: AUTH, "Content-Type": "application/x-www-form-urlencoded" },
+      body: form(params),
+    }),
+  );
+}
+
+/** POST with a raw body, for exercising encodings the form helper would escape. */
+export async function postRaw(app: Hono<AppEnv>, path: string, body: string): Promise<Result> {
+  return result(
+    await app.request(path, {
+      method: "POST",
+      headers: { Authorization: AUTH, "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    }),
+  );
+}
+
+export async function get(app: Hono<AppEnv>, path: string): Promise<Result> {
+  return result(await app.request(path, { headers: { Authorization: AUTH } }));
 }
 
 /** A catalog with one monthly plan, and optionally a trial on it. */

@@ -1,12 +1,101 @@
 import { randomBytes } from "crypto";
-import type { Context, ContentfulStatusCode } from "@emulators/core";
-import type { PeriodUnit } from "./entities.js";
+import type { Context } from "@emulators/core";
+import type { ItemType, PeriodUnit, PricingModel } from "./entities.js";
 import type { ChargebeeStore } from "./store.js";
 
 export type ErrorType = "payment" | "invalid_request" | "operation_failed" | "io_error" | "client_error";
 
 export function chargebeeId(prefix: string): string {
   return `${prefix}_${randomBytes(12).toString("base64url").slice(0, 16)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+//
+// Request handling raises RequestError from wherever the problem is noticed, and
+// one middleware turns it into a Chargebee-shaped response. Keeping that in a
+// single place means a new validation rule cannot forget to produce the right
+// error body, and route handlers stay readable.
+// ---------------------------------------------------------------------------
+
+export class RequestError extends Error {
+  constructor(
+    readonly status: number,
+    readonly apiErrorCode: string,
+    message: string,
+    readonly errorType: ErrorType = "invalid_request",
+    readonly param?: string,
+  ) {
+    super(message);
+    this.name = "RequestError";
+  }
+}
+
+export function chargebeeError(
+  c: Context,
+  status: number,
+  apiErrorCode: string,
+  message: string,
+  type: ErrorType = "invalid_request",
+  param?: string,
+): Response {
+  return c.json(
+    {
+      message,
+      type,
+      api_error_code: apiErrorCode,
+      error_code: apiErrorCode,
+      error_msg: message,
+      http_status_code: status,
+      ...(param ? { param, error_param: param } : {}),
+    },
+    status,
+  );
+}
+
+/** Render a RequestError, or return null when the failure is something else. */
+export function requestErrorResponse(c: Context, error: unknown): Response | null {
+  if (!(error instanceof RequestError)) return null;
+  return chargebeeError(c, error.status, error.apiErrorCode, error.message, error.errorType, error.param);
+}
+
+export function notFound(c: Context, detail?: string): Response {
+  return chargebeeError(c, 404, "resource_not_found", detail ?? "Sorry, we couldn't find that resource");
+}
+
+export function invalidState(c: Context, message: string): Response {
+  return chargebeeError(c, 409, "invalid_state_for_request", message);
+}
+
+export function duplicate(c: Context, message: string): Response {
+  return chargebeeError(c, 409, "duplicate_entry", message);
+}
+
+export function missingParam(param: string, message?: string): RequestError {
+  return new RequestError(400, "param_required", message ?? `${param} is required`, "invalid_request", param);
+}
+
+export function badParam(param: string, message: string): RequestError {
+  return new RequestError(400, "param_wrong_value", message, "invalid_request", param);
+}
+
+/**
+ * Refuse an operation this emulator does not reproduce faithfully.
+ *
+ * The status and code are deliberately outside Chargebee's own vocabulary. Behavior
+ * that depends on undocumented arithmetic — proration, tax, dunning schedules — is
+ * refused rather than guessed, because a plausible wrong number turns into a passing
+ * test over figures production computes differently. Failing loudly is recoverable;
+ * silently disagreeing with the real API is not.
+ */
+export function notEmulated(c: Context, operation: string, reason: string): Response {
+  return chargebeeError(
+    c,
+    501,
+    "not_emulated",
+    `${operation} is not emulated: ${reason}. See the chargebee emulator docs for what is covered.`,
+    "operation_failed",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +149,15 @@ const FIXED_PERIOD_SECONDS: Record<"day" | "week", number> = {
  * off-by-one-day billing bugs, so it is reproduced exactly.
  */
 export function addPeriod(fromSeconds: number, period: number, unit: PeriodUnit): number {
+  if (period <= 0) {
+    throw new RequestError(
+      500,
+      "internal_error",
+      `A billing period must be positive, received ${period}`,
+      "operation_failed",
+    );
+  }
+
   if (unit === "day" || unit === "week") {
     return fromSeconds + period * FIXED_PERIOD_SECONDS[unit];
   }
@@ -89,78 +187,66 @@ export function monthsInPeriod(period: number, unit: PeriodUnit): number {
 // Authentication
 //
 // Chargebee authenticates with HTTP basic, the API key as the username and an empty
-// password. Any key is accepted, but a missing one still fails, so a misconfigured
-// client breaks here the same way it would in production.
+// password. Any key is accepted, but the username has to be there: checking only
+// for the scheme prefix would let `Authorization: Basic Og==`, which decodes to an
+// empty username, authenticate as though a key had been supplied.
 // ---------------------------------------------------------------------------
 
 export function decodeBasicAuth(c: Context): { username: string; password: string } | null {
   const header = c.req.header("Authorization") ?? "";
   if (!header.toLowerCase().startsWith("basic ")) return null;
+
+  const encoded = header.slice(6).trim();
+  if (!encoded) return null;
+
+  let decoded: string;
   try {
-    const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
-    const idx = decoded.indexOf(":");
-    if (idx === -1) return { username: decoded, password: "" };
-    return { username: decoded.slice(0, idx), password: decoded.slice(idx + 1) };
+    decoded = Buffer.from(encoded, "base64").toString("utf8");
   } catch {
     return null;
   }
+
+  const separator = decoded.indexOf(":");
+  if (separator === -1) return { username: decoded, password: "" };
+  return { username: decoded.slice(0, separator), password: decoded.slice(separator + 1) };
 }
 
 // ---------------------------------------------------------------------------
-// Errors
+// Type guards
+//
+// The repository bans `as` assertions, and for parsing untrusted request values
+// that is the right rule: an assertion here would let a nonsense period unit or
+// item type through to be stored and later formatted into a response.
 // ---------------------------------------------------------------------------
 
-export function chargebeeError(
-  c: Context,
-  status: number,
-  apiErrorCode: string,
-  message: string,
-  type: ErrorType = "invalid_request",
-  param?: string,
-) {
-  return c.json(
-    {
-      message,
-      type,
-      api_error_code: apiErrorCode,
-      error_code: apiErrorCode,
-      error_msg: message,
-      http_status_code: status,
-      ...(param ? { param, error_param: param } : {}),
-    },
-    status as ContentfulStatusCode,
-  );
+const ITEM_TYPES: readonly ItemType[] = ["plan", "addon", "charge"];
+const PERIOD_UNITS: readonly PeriodUnit[] = ["day", "week", "month", "year"];
+const PRICING_MODELS: readonly PricingModel[] = ["per_unit", "flat_fee"];
+
+export function asItemType(value: string | undefined): ItemType | undefined {
+  return ITEM_TYPES.find((candidate) => candidate === value);
 }
 
-export function notFound(c: Context, detail?: string) {
-  return chargebeeError(c, 404, "resource_not_found", detail ?? "Sorry, we couldn't find that resource");
+export function asPeriodUnit(value: string | undefined): PeriodUnit | undefined {
+  return PERIOD_UNITS.find((candidate) => candidate === value);
 }
 
-export function invalidState(c: Context, message: string) {
-  return chargebeeError(c, 409, "invalid_state_for_request", message);
+export function asPricingModel(value: string | undefined): PricingModel | undefined {
+  return PRICING_MODELS.find((candidate) => candidate === value);
 }
 
-export function paramError(c: Context, param: string, message: string) {
-  return chargebeeError(c, 400, "param_wrong_value", message, "invalid_request", param);
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
- * Refuse an operation this emulator does not reproduce faithfully.
+ * Read a named field off an entity for filtering.
  *
- * The status and code are deliberately outside Chargebee's own vocabulary. Behavior
- * that depends on undocumented arithmetic — proration, tax, dunning schedules — is
- * refused rather than guessed, because a plausible wrong number turns into a passing
- * test over figures production computes differently. Failing loudly is recoverable;
- * silently disagreeing with the real API is not.
+ * Filters name their field as a string, so the read is only resolvable at runtime.
+ * `Reflect.get` keeps that in one place without widening the entity types.
  */
-export function notEmulated(c: Context, operation: string, reason: string) {
-  return chargebeeError(
-    c,
-    501,
-    "not_emulated",
-    `${operation} is not emulated: ${reason}. See the chargebee emulator docs for what is covered.`,
-    "operation_failed",
-  );
+export function fieldOf(entity: object, name: string): unknown {
+  return Reflect.get(entity, name);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,50 +264,64 @@ export function notEmulated(c: Context, operation: string, reason: string) {
 // fields.
 // ---------------------------------------------------------------------------
 
+/**
+ * Keys that must never be used as a path segment.
+ *
+ * Without this, `__proto__[x]=1` would walk the accumulator up to Object.prototype
+ * and write there, so a single query string could change object behavior for the
+ * whole process. Accumulators are also created with a null prototype, which removes
+ * the inherited properties this walk could otherwise reach.
+ */
+const FORBIDDEN_KEYS: readonly string[] = ["__proto__", "constructor", "prototype"];
+
 export async function parseChargebeeBody(c: Context): Promise<Record<string, unknown>> {
   const contentType = c.req.header("Content-Type") ?? "";
   const raw = await c.req.text();
-  if (!raw) return {};
+  if (!raw) return Object.create(null);
 
   if (contentType.includes("application/json")) {
+    let parsed: unknown;
     try {
-      const parsed: unknown = JSON.parse(raw);
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+      parsed = JSON.parse(raw);
     } catch {
-      return {};
+      throw badParam("body", "Request body is not valid JSON");
     }
+    if (!isPlainObject(parsed)) return Object.create(null);
+    return { ...Object.create(null), ...parsed };
   }
 
   return parseBracketParams(new URLSearchParams(raw));
 }
 
 export function parseBracketParams(params: URLSearchParams): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
+  const result: Record<string, unknown> = Object.create(null);
+
   for (const [key, value] of params) {
     const path = key.replace(/\]/g, "").split("[");
-    let target: Record<string, unknown> = result;
-    for (let i = 0; i < path.length - 1; i++) {
-      const part = path[i] as string;
-      const current = target[part];
-      if (current === undefined || current === null || typeof current !== "object") {
-        target[part] = {};
-      }
-      target = target[part] as Record<string, unknown>;
-    }
-    target[path[path.length - 1] as string] = value;
-  }
-  return result;
-}
 
-/**
- * Read a named field off an entity for filtering.
- *
- * Filters arrive as strings, so the field being read is only known at runtime. This
- * keeps that one unavoidable widening in a single place instead of scattering casts
- * through every list route.
- */
-export function fieldOf(entity: object, name: string): unknown {
-  return (entity as unknown as Record<string, unknown>)[name];
+    const forbidden = path.find((segment) => FORBIDDEN_KEYS.includes(segment));
+    if (forbidden !== undefined) {
+      throw badParam(key, `Parameter name may not contain ${forbidden}`);
+    }
+
+    let target = result;
+    for (let i = 0; i < path.length - 1; i++) {
+      const part = path[i];
+      if (part === undefined) continue;
+      const current = target[part];
+      if (!isPlainObject(current)) {
+        target[part] = Object.create(null);
+      }
+      const next = target[part];
+      if (!isPlainObject(next)) break;
+      target = next;
+    }
+
+    const last = path[path.length - 1];
+    if (last !== undefined) target[last] = value;
+  }
+
+  return result;
 }
 
 export function readString(source: Record<string, unknown>, key: string): string | undefined {
@@ -235,7 +335,10 @@ export function readNumber(source: Record<string, unknown>, key: string): number
   const raw = readString(source, key);
   if (raw === undefined) return undefined;
   const value = Number(raw);
-  return Number.isFinite(value) ? value : undefined;
+  if (!Number.isFinite(value)) {
+    throw badParam(key, `${key} must be a number, received ${raw}`);
+  }
+  return value;
 }
 
 export function readBoolean(source: Record<string, unknown>, key: string): boolean | undefined {
@@ -246,7 +349,7 @@ export function readBoolean(source: Record<string, unknown>, key: string): boole
 
 export function readGroup(source: Record<string, unknown>, key: string): Record<string, unknown> {
   const value = source[key];
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  return isPlainObject(value) ? value : Object.create(null);
 }
 
 /**
@@ -260,8 +363,8 @@ export function readIndexed(source: Record<string, unknown>, key: string): Array
   const indices = new Set<number>();
 
   for (const attribute of Object.values(group)) {
-    if (!attribute || typeof attribute !== "object") continue;
-    for (const index of Object.keys(attribute as Record<string, unknown>)) {
+    if (!isPlainObject(attribute)) continue;
+    for (const index of Object.keys(attribute)) {
       const parsed = Number(index);
       if (Number.isInteger(parsed) && parsed >= 0) indices.add(parsed);
     }
@@ -271,8 +374,8 @@ export function readIndexed(source: Record<string, unknown>, key: string): Array
   for (const index of [...indices].sort((a, b) => a - b)) {
     const row: Record<string, string> = {};
     for (const [attribute, values] of Object.entries(group)) {
-      if (!values || typeof values !== "object") continue;
-      const value = (values as Record<string, unknown>)[String(index)];
+      if (!isPlainObject(values)) continue;
+      const value = values[String(index)];
       if (typeof value === "string" && value !== "") row[attribute] = value;
     }
     if (Object.keys(row).length > 0) rows.push(row);
@@ -290,35 +393,60 @@ export interface Filter {
   value: string;
 }
 
+const FILTER_OPERATORS: readonly string[] = [
+  "is",
+  "is_not",
+  "in",
+  "not_in",
+  "starts_with",
+  "is_present",
+  "gt",
+  "gte",
+  "lt",
+  "lte",
+];
+
 /** Read Chargebee list filters such as `status[is]=active` or `id[in]=["a","b"]`. */
 export function readFilters(c: Context, fields: readonly string[]): Filter[] {
   const parsed = parseBracketParams(new URLSearchParams(c.req.url.split("?")[1] ?? ""));
   const filters: Filter[] = [];
+
   for (const field of fields) {
     const node = parsed[field];
     if (node === undefined) continue;
+
     if (typeof node === "string") {
       filters.push({ field, operator: "is", value: node });
       continue;
     }
-    if (node && typeof node === "object") {
-      for (const [operator, value] of Object.entries(node as Record<string, unknown>)) {
-        if (typeof value === "string") filters.push({ field, operator, value });
+
+    if (!isPlainObject(node)) continue;
+    for (const [operator, value] of Object.entries(node)) {
+      if (typeof value !== "string") continue;
+      // Rejected rather than ignored. Treating an unrecognised operator as a
+      // no-op makes a filter silently match everything, so a typo'd query returns
+      // the whole collection and the caller believes it was filtered.
+      if (!FILTER_OPERATORS.includes(operator)) {
+        throw badParam(`${field}[${operator}]`, `Unsupported filter operator: ${field}[${operator}]`);
       }
+      filters.push({ field, operator, value });
     }
   }
+
   return filters;
 }
 
 function asList(value: string): string[] {
   const trimmed = value.trim();
   if (!trimmed.startsWith("[")) return [trimmed];
+
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(trimmed);
-    return Array.isArray(parsed) ? parsed.map((entry) => String(entry)) : [];
+    parsed = JSON.parse(trimmed);
   } catch {
-    return [];
+    throw badParam("filter", `Could not parse list filter value: ${value}`);
   }
+  return Array.isArray(parsed) ? parsed.map((entry) => String(entry)) : [];
 }
 
 export function matchesFilters(filters: readonly Filter[], read: (field: string) => unknown): boolean {
@@ -347,7 +475,9 @@ export function matchesFilters(filters: readonly Filter[], read: (field: string)
       case "lte":
         return Number(text) <= Number(filter.value);
       default:
-        return true;
+        // readFilters rejects unknown operators, so reaching here means the two
+        // lists have drifted apart.
+        throw badParam(filter.field, `Unsupported filter operator: ${filter.field}[${filter.operator}]`);
     }
   });
 }
@@ -361,7 +491,7 @@ export function chargebeeList<T>(c: Context, items: readonly T[], entries: (item
   const rawOffset = c.req.query("offset");
   const start = rawOffset === undefined ? 0 : parseInt(rawOffset, 10);
   if (!Number.isInteger(start) || start < 0) {
-    return paramError(c, "offset", "Invalid offset");
+    throw badParam("offset", "Invalid offset");
   }
 
   const page = items.slice(start, start + limit);

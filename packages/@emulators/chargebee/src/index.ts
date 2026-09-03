@@ -10,7 +10,17 @@ import type {
 } from "@emulators/core";
 import { materializeSubscription } from "./billing.js";
 import type { ItemType, PeriodUnit, PricingModel } from "./entities.js";
-import { chargebeeError, chargebeeId, DEFAULT_EPOCH, setNow } from "./helpers.js";
+import {
+  asItemType,
+  asPeriodUnit,
+  asPricingModel,
+  chargebeeError,
+  chargebeeId,
+  DEFAULT_EPOCH,
+  decodeBasicAuth,
+  requestErrorResponse,
+  setNow,
+} from "./helpers.js";
 import { catalogRoutes } from "./routes/catalog.js";
 import { customerRoutes } from "./routes/customers.js";
 import { eventRoutes } from "./routes/events.js";
@@ -208,7 +218,7 @@ export function seedFromConfig(
       chargebee_id: item.id,
       name: item.name ?? item.id,
       external_name: null,
-      type: item.type ?? "plan",
+      type: asItemType(item.type) ?? "plan",
       item_family_id: familyId,
       metered: false,
       created: at,
@@ -220,6 +230,15 @@ export function seedFromConfig(
     if (cs.itemPrices.findOneBy("chargebee_id", price.id)) continue;
     const item = cs.items.findOneBy("chargebee_id", price.item);
     if (!item) continue;
+
+    // A seed file is configuration rather than a request, so it is validated the
+    // same way: a non-positive period here would leave the subscription
+    // permanently due and make a single time jump generate invoices unbounded.
+    const period = price.period ?? 1;
+    if (!Number.isInteger(period) || period <= 0) {
+      throw new Error(`chargebee seed: item price [${price.id}] has a non-positive period (${period})`);
+    }
+
     cs.itemPrices.insert({
       chargebee_id: price.id,
       name: price.name ?? price.id,
@@ -227,14 +246,14 @@ export function seedFromConfig(
       item_family_id: item.item_family_id,
       item_id: item.chargebee_id,
       item_type: item.type,
-      pricing_model: price.pricing_model ?? "per_unit",
+      pricing_model: asPricingModel(price.pricing_model) ?? "per_unit",
       price: price.price,
-      period: price.period ?? 1,
-      period_unit: price.period_unit ?? "month",
+      period,
+      period_unit: asPeriodUnit(price.period_unit) ?? "month",
       free_quantity: price.free_quantity ?? 0,
       currency_code: price.currency_code ?? "USD",
       trial_period: price.trial_period ?? null,
-      trial_period_unit: price.trial_period_unit ?? null,
+      trial_period_unit: asPeriodUnit(price.trial_period_unit) ?? null,
       created: at,
       updated: at,
     });
@@ -304,6 +323,19 @@ export const chargebeePlugin: ServicePlugin = {
     // empty password. Any key is accepted, but a missing one is still rejected so a
     // misconfigured client fails here the way it would in production instead of
     // quietly succeeding.
+    // One error boundary for the whole plugin. Validation raises RequestError from
+    // wherever the problem is noticed and it becomes a Chargebee-shaped response
+    // here, so no route can accidentally return a differently shaped error.
+    app.use("*", async (c, next) => {
+      try {
+        await next();
+      } catch (error) {
+        const response = requestErrorResponse(c, error);
+        if (response) return response;
+        throw error;
+      }
+    });
+
     // Scoped by hand rather than by route pattern: the router only treats a bare "*"
     // as a wildcard, so a prefixed pattern would silently never match and every
     // request would sail through unauthenticated.
@@ -312,10 +344,15 @@ export const chargebeePlugin: ServicePlugin = {
         await next();
         return;
       }
-      const header = c.req.header("Authorization") ?? "";
-      if (!header.toLowerCase().startsWith("basic ")) {
+
+      // Any API key is accepted, but it has to be present. Checking only for the
+      // scheme prefix would let `Basic Og==`, which decodes to an empty username,
+      // authenticate as though a key had been supplied.
+      const credentials = decodeBasicAuth(c);
+      if (!credentials || credentials.username.trim() === "") {
         return chargebeeError(c, 401, "api_authentication_failed", "Sorry, authentication failed. Invalid API key");
       }
+
       await next();
     });
 

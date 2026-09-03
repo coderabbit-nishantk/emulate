@@ -1,6 +1,6 @@
-import type { RouteContext } from "@emulators/core";
-import { renderCardPage } from "@emulators/core";
-import { chargebeeError, chargebeeId, notFound, now, parseChargebeeBody, readGroup, readString } from "../helpers.js";
+import type { Context, RouteContext } from "@emulators/core";
+import { escapeHtml, renderCardPage } from "@emulators/core";
+import { chargebeeId, missingParam, notFound, now, parseChargebeeBody, readGroup, readString } from "../helpers.js";
 import { getChargebeeStore } from "../store.js";
 
 const SERVICE_LABEL = "Chargebee";
@@ -17,9 +17,7 @@ export function hostedPageRoutes({ app, store, baseUrl }: RouteContext): void {
   app.post("/api/v2/portal_sessions", async (c) => {
     const body = await parseChargebeeBody(c);
     const customerId = readString(readGroup(body, "customer"), "id") ?? readString(body, "customer_id");
-    if (!customerId) {
-      return chargebeeError(c, 400, "param_required", "customer[id] is required", "invalid_request", "customer[id]");
-    }
+    if (!customerId) throw missingParam("customer[id]");
     if (!cs.customers.findOneBy("chargebee_id", customerId)) return notFound(c);
 
     const at = now(cs);
@@ -39,7 +37,7 @@ export function hostedPageRoutes({ app, store, baseUrl }: RouteContext): void {
     });
   });
 
-  const hostedPage = async (c: Parameters<Parameters<typeof app.get>[1]>[0], type: string) => {
+  const hostedPage = async (c: Context, type: string) => {
     const body = await parseChargebeeBody(c);
     const at = now(cs);
     const id = chargebeeId("hp");
@@ -64,25 +62,21 @@ export function hostedPageRoutes({ app, store, baseUrl }: RouteContext): void {
   app.post("/api/v2/hosted_pages/checkout_new_for_items", (c) => hostedPage(c, "checkout_new"));
   app.post("/api/v2/hosted_pages/manage_payment_sources", (c) => hostedPage(c, "manage_payment_sources"));
 
-  app.get("/portal/:id", (c) =>
+  /**
+   * These two are the emulator's only browser-facing pages, so the path parameter
+   * is escaped before it reaches the HTML. It is attacker-controlled and reflected,
+   * which is the textbook shape of a reflected XSS.
+   */
+  const handoffPage = (c: Context, kind: string, title: string) =>
     c.html(
       renderCardPage(
-        "Customer portal",
+        title,
         "Emulated Chargebee hand-off page",
-        `<p class="empty">Session <code>${c.req.param("id")}</code>. The emulator does not reproduce the hosted portal UI. Drive the API directly instead.</p>`,
+        `<p class="empty">${escapeHtml(kind)} <code>${escapeHtml(c.req.param("id"))}</code>. The emulator does not reproduce the hosted UI. Drive the API directly instead.</p>`,
         SERVICE_LABEL,
       ),
-    ),
-  );
+    );
 
-  app.get("/hosted/:id", (c) =>
-    c.html(
-      renderCardPage(
-        "Hosted page",
-        "Emulated Chargebee hand-off page",
-        `<p class="empty">Page <code>${c.req.param("id")}</code>. The emulator does not reproduce the hosted checkout UI. Drive the API directly instead.</p>`,
-        SERVICE_LABEL,
-      ),
-    ),
-  );
+  app.get("/portal/:id", (c) => handoffPage(c, "Session", "Customer portal"));
+  app.get("/hosted/:id", (c) => handoffPage(c, "Page", "Hosted page"));
 }

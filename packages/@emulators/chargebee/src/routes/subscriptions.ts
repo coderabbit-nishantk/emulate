@@ -1,6 +1,5 @@
 import type { RouteContext } from "@emulators/core";
 import {
-  billingErrorResponse,
   cancelSubscription,
   createSubscription,
   reactivateSubscription,
@@ -9,11 +8,12 @@ import {
 } from "../billing.js";
 import { formatCustomer, formatInvoice, formatSubscription } from "../formatters.js";
 import {
-  chargebeeError,
+  badParam,
   chargebeeList,
   fieldOf,
   invalidState,
   matchesFilters,
+  missingParam,
   notEmulated,
   notFound,
   now,
@@ -58,25 +58,19 @@ export function subscriptionRoutes({ app, store, webhooks }: RouteContext): void
       return notEmulated(c, "coupons and discounts", "stacking rules and application order are not publicly specified");
     }
 
-    try {
-      const { subscription, invoice } = await createSubscription(ctx, {
-        customerId: customer.chargebee_id,
-        items: requestedItems(body),
-        startDate: readNumber(body, "start_date"),
-        trialEnd: readNumber(body, "trial_end"),
-      });
+    const { subscription, invoice } = await createSubscription(ctx, {
+      customerId: customer.chargebee_id,
+      items: requestedItems(body),
+      startDate: readNumber(body, "start_date"),
+      trialEnd: readNumber(body, "trial_end"),
+    });
 
-      const refreshed = cs.customers.findOneBy("chargebee_id", customer.chargebee_id) ?? customer;
-      return c.json({
-        subscription: formatSubscription(subscription),
-        customer: formatCustomer(refreshed),
-        ...(invoice ? { invoice: formatInvoice(invoice) } : {}),
-      });
-    } catch (error) {
-      const response = billingErrorResponse(c, error);
-      if (response) return response;
-      throw error;
-    }
+    const refreshed = cs.customers.findOneBy("chargebee_id", customer.chargebee_id) ?? customer;
+    return c.json({
+      subscription: formatSubscription(subscription),
+      customer: formatCustomer(refreshed),
+      ...(invoice ? { invoice: formatInvoice(invoice) } : {}),
+    });
   });
 
   app.get("/api/v2/subscriptions/:id", (c) => {
@@ -127,18 +121,12 @@ export function subscriptionRoutes({ app, store, webhooks }: RouteContext): void
       );
     }
 
-    try {
-      const updated = await updateSubscriptionItems(ctx, subscription, requestedItems(body));
-      const customer = cs.customers.findOneBy("chargebee_id", updated.customer_id);
-      return c.json({
-        subscription: formatSubscription(updated),
-        ...(customer ? { customer: formatCustomer(customer) } : {}),
-      });
-    } catch (error) {
-      const response = billingErrorResponse(c, error);
-      if (response) return response;
-      throw error;
-    }
+    const updated = await updateSubscriptionItems(ctx, subscription, requestedItems(body));
+    const customer = cs.customers.findOneBy("chargebee_id", updated.customer_id);
+    return c.json({
+      subscription: formatSubscription(updated),
+      ...(customer ? { customer: formatCustomer(customer) } : {}),
+    });
   });
 
   app.post("/api/v2/subscriptions/:id/cancel_for_items", async (c) => {
@@ -146,42 +134,30 @@ export function subscriptionRoutes({ app, store, webhooks }: RouteContext): void
     if (!subscription) return notFound(c);
 
     const body = await parseChargebeeBody(c);
-    try {
-      const cancelled = await cancelSubscription(
-        ctx,
-        subscription,
-        readBoolean(body, "end_of_term") ?? false,
-        readString(body, "cancel_reason_code"),
-      );
-      const customer = cs.customers.findOneBy("chargebee_id", cancelled.customer_id);
-      return c.json({
-        subscription: formatSubscription(cancelled),
-        ...(customer ? { customer: formatCustomer(customer) } : {}),
-      });
-    } catch (error) {
-      const response = billingErrorResponse(c, error);
-      if (response) return response;
-      throw error;
-    }
+    const cancelled = await cancelSubscription(
+      ctx,
+      subscription,
+      readBoolean(body, "end_of_term") ?? false,
+      readString(body, "cancel_reason_code"),
+    );
+    const customer = cs.customers.findOneBy("chargebee_id", cancelled.customer_id);
+    return c.json({
+      subscription: formatSubscription(cancelled),
+      ...(customer ? { customer: formatCustomer(customer) } : {}),
+    });
   });
 
   app.post("/api/v2/subscriptions/:id/reactivate", async (c) => {
     const subscription = cs.subscriptions.findOneBy("chargebee_id", c.req.param("id"));
     if (!subscription) return notFound(c);
 
-    try {
-      const result = await reactivateSubscription(ctx, subscription);
-      const customer = cs.customers.findOneBy("chargebee_id", result.subscription.customer_id);
-      return c.json({
-        subscription: formatSubscription(result.subscription),
-        ...(customer ? { customer: formatCustomer(customer) } : {}),
-        ...(result.invoice ? { invoice: formatInvoice(result.invoice) } : {}),
-      });
-    } catch (error) {
-      const response = billingErrorResponse(c, error);
-      if (response) return response;
-      throw error;
-    }
+    const result = await reactivateSubscription(ctx, subscription);
+    const customer = cs.customers.findOneBy("chargebee_id", result.subscription.customer_id);
+    return c.json({
+      subscription: formatSubscription(result.subscription),
+      ...(customer ? { customer: formatCustomer(customer) } : {}),
+      ...(result.invoice ? { invoice: formatInvoice(result.invoice) } : {}),
+    });
   });
 
   app.post("/api/v2/subscriptions/:id/change_term_end", async (c) => {
@@ -190,17 +166,27 @@ export function subscriptionRoutes({ app, store, webhooks }: RouteContext): void
 
     const body = await parseChargebeeBody(c);
     const termEndsAt = readNumber(body, "term_ends_at");
-    if (termEndsAt === undefined) {
-      return chargebeeError(c, 400, "param_required", "term_ends_at is required", "invalid_request", "term_ends_at");
-    }
+    if (termEndsAt === undefined) throw missingParam("term_ends_at");
+
     if (subscription.status !== "active" && subscription.status !== "in_trial") {
       return invalidState(c, `Cannot change the term end of a ${subscription.status} subscription`);
+    }
+
+    // A past value would leave the subscription with an already-elapsed billing date,
+    // so the next time jump would bill the term immediately. A value before the term
+    // start would produce a negative term.
+    const at = now(cs);
+    if (termEndsAt <= at) {
+      throw badParam("term_ends_at", "term_ends_at must be in the future");
+    }
+    if (subscription.current_term_start !== null && termEndsAt <= subscription.current_term_start) {
+      throw badParam("term_ends_at", "term_ends_at must be after the current term start");
     }
 
     const updated = cs.subscriptions.update(subscription.id, {
       current_term_end: termEndsAt,
       next_billing_at: termEndsAt,
-      updated: now(cs),
+      updated: at,
     });
     if (!updated) return notFound(c);
 

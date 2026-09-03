@@ -16,6 +16,11 @@ const TABS: InspectorTab[] = [
 
 type TabId = (typeof TABS)[number]["id"];
 
+/** Resolve a query value to a known tab without asserting its type. */
+function asTabId(value: string | undefined): TabId {
+  return TABS.find((tab) => tab.id === value)?.id ?? "customers";
+}
+
 /**
  * What the emulator claims about itself.
  *
@@ -92,8 +97,7 @@ export function inspectorRoutes({ app, store }: RouteContext): void {
   const cs = getChargebeeStore(store);
 
   app.get("/", (c) => {
-    const requested = c.req.query("tab") ?? "customers";
-    const active: TabId = TABS.some((tab) => tab.id === requested) ? (requested as TabId) : "customers";
+    const active = asTabId(c.req.query("tab"));
 
     let body: string;
 

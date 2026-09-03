@@ -26,7 +26,7 @@ const chargebee = new Chargebee({
 });
 ```
 
-Chargebee authenticates with HTTP basic, the API key as the username and an empty password. Any key is accepted, but a missing one is still rejected so a misconfigured client fails here the way it would in production.
+Chargebee authenticates with HTTP basic, the API key as the username and an empty password. Any non-empty key is accepted; a missing or empty one is rejected, including a header such as `Basic Og==` that decodes to no username, so a misconfigured client fails here the way it would in production.
 
 ## Time is an input, not a fact
 

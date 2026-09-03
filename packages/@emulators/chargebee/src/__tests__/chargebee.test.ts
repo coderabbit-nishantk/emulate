@@ -1,9 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { addPeriod, DEFAULT_EPOCH } from "../index.js";
-import { AUTH, catalogSeed, createChargebeeTestApp, form, get, post } from "./helpers.js";
+import { AUTH, catalogSeed, createChargebeeTestApp, form, get, post, postRaw } from "./helpers.js";
 
 const FEB_1 = Date.parse("2026-02-01T00:00:00Z") / 1000;
 const YEAR = 365 * 86400;
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 function subscribe(quantity?: number): Record<string, string | number | undefined> {
   return {
@@ -44,7 +48,7 @@ describe("authentication", () => {
     const { app } = createChargebeeTestApp();
     const response = await app.request("/api/v2/customers");
     expect(response.status).toBe(401);
-    const body = (await response.json()) as any;
+    const body: any = await response.json();
     expect(body.api_error_code).toBe("api_authentication_failed");
     expect(body.type).toBe("invalid_request");
   });
@@ -400,11 +404,11 @@ describe("webhooks", () => {
     const calls: Array<{ url: string; body: any; auth: string | undefined }> = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: any, init: any) => {
+      vi.fn(async (url: string, init: { body: string; headers: Record<string, string> }) => {
         calls.push({
           url: String(url),
-          body: JSON.parse(init.body as string),
-          auth: (init.headers as Record<string, string>)["Authorization"],
+          body: JSON.parse(init.body),
+          auth: init.headers["Authorization"],
         });
         return new Response("{}", { status: 200 });
       }),
@@ -420,8 +424,6 @@ describe("webhooks", () => {
     expect(types).toContain("subscription_created");
     expect(types).toContain("invoice_generated");
     expect(calls[0]?.auth).toBe(`Basic ${Buffer.from("hookuser:hookpass").toString("base64")}`);
-
-    vi.unstubAllGlobals();
   });
 });
 
@@ -463,7 +465,6 @@ describe("seeding", () => {
 
     // Seeded state is a precondition, not something that just happened.
     expect(fetchSpy).not.toHaveBeenCalled();
-    vi.unstubAllGlobals();
   });
 
   it("honours an explicit starting clock", async () => {
@@ -521,7 +522,7 @@ describe("form encoding", () => {
       body: JSON.stringify({ id: "cus_json", email: "json@acme.example" }),
     });
     expect(response.status).toBe(200);
-    const body = (await response.json()) as any;
+    const body: any = await response.json();
     expect(body.customer.email).toBe("json@acme.example");
   });
 
@@ -532,7 +533,270 @@ describe("form encoding", () => {
       headers: { Authorization: AUTH, "Content-Type": "application/x-www-form-urlencoded" },
       body: form({ id: "cus_space", first_name: "Ada Lovelace" }),
     });
-    const body = (await response.json()) as any;
+    const body: any = await response.json();
     expect(body.customer.first_name).toBe("Ada Lovelace");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regressions from the first review round. Each of these was a real defect, so
+// each gets a test that fails against the original implementation.
+// ---------------------------------------------------------------------------
+
+describe("request parsing hardening", () => {
+  it("refuses prototype keys instead of writing to Object.prototype", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+
+    const polluted = await postRaw(app, "/api/v2/customers", "__proto__[polluted]=yes&id=cus_proto");
+    expect(polluted.status).toBe(400);
+    expect(polluted.body.api_error_code).toBe("param_wrong_value");
+
+    // The real assertion: nothing leaked onto the prototype chain.
+    expect(Reflect.get({}, "polluted")).toBeUndefined();
+    expect(Object.prototype).not.toHaveProperty("polluted");
+  });
+
+  it("refuses constructor and prototype segments too", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    for (const key of ["constructor[x]=1", "prototype[x]=1", "a[__proto__][b]=1"]) {
+      const response = await postRaw(app, "/api/v2/customers", key);
+      expect(response.status, key).toBe(400);
+    }
+  });
+
+  it("rejects an unknown filter operator rather than matching everything", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    for (let index = 0; index < 3; index += 1) {
+      await post(app, "/api/v2/customers", { id: `cus_${index}` });
+    }
+
+    const response = await get(app, "/api/v2/customers?email[fuzzy]=nobody@example.com");
+    expect(response.status).toBe(400);
+    expect(response.body.api_error_code).toBe("param_wrong_value");
+    expect(response.body.param).toBe("email[fuzzy]");
+  });
+
+  it("rejects a non-numeric value where a number is required", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const response = await post(app, "/api/v2/time_machines/default/travel_forward", {
+      destination_time: "soon",
+    });
+    expect(response.status).toBe(400);
+    expect(response.body.param).toBe("destination_time");
+  });
+});
+
+describe("authentication hardening", () => {
+  it("rejects Basic credentials with an empty username", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    // "Og==" decodes to ":" — a present header carrying no API key at all.
+    const response = await app.request("/api/v2/customers", { headers: { Authorization: "Basic Og==" } });
+    expect(response.status).toBe(401);
+    const body: any = await response.json();
+    expect(body.api_error_code).toBe("api_authentication_failed");
+  });
+
+  it("rejects a Basic header with no payload", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    for (const header of ["Basic", "Basic ", "Basic    "]) {
+      const response = await app.request("/api/v2/customers", { headers: { Authorization: header } });
+      expect(response.status, header).toBe(401);
+    }
+  });
+
+  it("still accepts any non-empty key", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const response = await app.request("/api/v2/customers", {
+      headers: { Authorization: `Basic ${Buffer.from("literally_anything:").toString("base64")}` },
+    });
+    expect(response.status).toBe(200);
+  });
+});
+
+describe("hand-off pages", () => {
+  it("escapes the path parameter", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const payload = "<script>alert(1)</script>";
+
+    for (const route of ["portal", "hosted"]) {
+      const response = await app.request(`/${route}/${encodeURIComponent(payload)}`);
+      expect(response.status, route).toBe(200);
+      const html = await response.text();
+      expect(html, route).not.toContain("<script>alert(1)</script>");
+      expect(html, route).toContain("&lt;script&gt;");
+    }
+  });
+});
+
+describe("catalog integrity", () => {
+  it("rejects a duplicate item id", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const again = await post(app, "/api/v2/items", { id: "pro", item_family_id: "acme", type: "plan" });
+    expect(again.status).toBe(409);
+    expect(again.body.api_error_code).toBe("duplicate_entry");
+
+    // One row, not two, so retrieve and list agree.
+    const list = await get(app, "/api/v2/items?limit=100");
+    expect(list.body.list.filter((entry: any) => entry.item.id === "pro")).toHaveLength(1);
+  });
+
+  it("rejects a duplicate item price id", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const again = await post(app, "/api/v2/item_prices", { id: "pro-monthly", item_id: "pro", price: 1 });
+    expect(again.status).toBe(409);
+
+    const list = await get(app, "/api/v2/item_prices?limit=100");
+    expect(list.body.list.filter((entry: any) => entry.item_price.id === "pro-monthly")).toHaveLength(1);
+  });
+
+  it("rejects a non-positive billing period", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    for (const period of [0, -1, 1.5]) {
+      const response = await post(app, "/api/v2/item_prices", {
+        id: `bad-${period}`,
+        item_id: "pro",
+        price: 1000,
+        period,
+      });
+      expect(response.status, String(period)).toBe(400);
+      expect(response.body.param, String(period)).toBe("period");
+    }
+  });
+
+  it("rejects an unknown period unit and a negative price", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+
+    const unit = await post(app, "/api/v2/item_prices", {
+      id: "bad-unit",
+      item_id: "pro",
+      price: 1000,
+      period_unit: "fortnight",
+    });
+    expect(unit.status).toBe(400);
+    expect(unit.body.param).toBe("period_unit");
+
+    const price = await post(app, "/api/v2/item_prices", { id: "bad-price", item_id: "pro", price: -1 });
+    expect(price.status).toBe(400);
+    expect(price.body.param).toBe("price");
+  });
+
+  it("rejects a non-object meta_data", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    for (const value of ['["a"]', '"text"', "42"]) {
+      const response = await post(app, "/api/v2/customers", { id: `cus_meta_${value.length}`, meta_data: value });
+      expect(response.status, value).toBe(400);
+      expect(response.body.param, value).toBe("meta_data");
+    }
+
+    const ok = await post(app, "/api/v2/customers", { id: "cus_meta_ok", meta_data: '{"tier":"gold"}' });
+    expect(ok.status).toBe(200);
+    expect(ok.body.customer.meta_data).toEqual({ tier: "gold" });
+  });
+});
+
+describe("event identity", () => {
+  it("uses one id for the stored event and the delivered webhook", async () => {
+    const delivered: any[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        delivered.push(JSON.parse(init.body));
+        return new Response("{}", { status: 200 });
+      }),
+    );
+
+    const seed = catalogSeed();
+    seed.webhooks = [{ url: "http://localhost:9999/hooks", events: ["*"] }];
+    const { app } = createChargebeeTestApp(seed);
+
+    await post(app, "/api/v2/customers/cus_acme/subscription_for_items", subscribe());
+
+    const created = delivered.find((event) => event.event_type === "subscription_created");
+    expect(created).toBeDefined();
+    expect(created.id).toMatch(/^ev_/);
+    expect(created.object).toBe("event");
+
+    // The id in the delivery has to be retrievable, as it is against the real API.
+    const fetched = await get(app, `/api/v2/events/${created.id}`);
+    expect(fetched.status).toBe(200);
+    expect(fetched.body.event.event_type).toBe("subscription_created");
+    expect(fetched.body.event.occurred_at).toBe(created.occurred_at);
+  });
+});
+
+describe("future-dated subscriptions", () => {
+  it("keeps the trial instead of billing at the start date", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed({ trialDays: 14 }));
+    const startDate = DEFAULT_EPOCH + 30 * 86400;
+
+    const created = await post(app, "/api/v2/customers/cus_acme/subscription_for_items", {
+      ...subscribe(),
+      start_date: startDate,
+    });
+    expect(created.body.subscription.status).toBe("future");
+    // The trial is recorded up front and runs from the start date, not from now.
+    expect(created.body.subscription.trial_start).toBe(startDate);
+    expect(created.body.subscription.trial_end).toBe(startDate + 14 * 86400);
+    expect(created.body.invoice).toBeUndefined();
+
+    const id = created.body.subscription.id;
+
+    // Reaching the start date begins the trial. It must not bill.
+    await post(app, "/api/v2/time_machines/default/travel_forward", { destination_time: startDate + 1 });
+    const inTrial = await get(app, `/api/v2/subscriptions/${id}`);
+    expect(inTrial.body.subscription.status).toBe("in_trial");
+    expect((await get(app, "/api/v2/invoices")).body.list).toHaveLength(0);
+
+    // Only when the trial elapses does the first invoice appear.
+    await post(app, "/api/v2/time_machines/default/travel_forward", {
+      destination_time: startDate + 15 * 86400,
+    });
+    const active = await get(app, `/api/v2/subscriptions/${id}`);
+    expect(active.body.subscription.status).toBe("active");
+    expect(active.body.subscription.activated_at).toBe(startDate + 14 * 86400);
+
+    const invoices = await get(app, "/api/v2/invoices");
+    expect(invoices.body.list).toHaveLength(1);
+    expect(invoices.body.list[0].invoice.first_invoice).toBe(true);
+  });
+
+  it("activates a future subscription with no trial at its start date", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const startDate = DEFAULT_EPOCH + 10 * 86400;
+
+    const created = await post(app, "/api/v2/customers/cus_acme/subscription_for_items", {
+      ...subscribe(),
+      start_date: startDate,
+    });
+    expect(created.body.subscription.status).toBe("future");
+
+    await post(app, "/api/v2/time_machines/default/travel_forward", { destination_time: startDate });
+    const after = await get(app, `/api/v2/subscriptions/${created.body.subscription.id}`);
+    expect(after.body.subscription.status).toBe("active");
+    expect(after.body.subscription.current_term_start).toBe(startDate);
+    expect((await get(app, "/api/v2/invoices")).body.list).toHaveLength(1);
+  });
+});
+
+describe("change_term_end bounds", () => {
+  it("rejects a term end in the past or before the term start", async () => {
+    const { app } = createChargebeeTestApp(catalogSeed());
+    const created = await post(app, "/api/v2/customers/cus_acme/subscription_for_items", subscribe());
+    const id = created.body.subscription.id;
+
+    for (const termEndsAt of [DEFAULT_EPOCH - 86400, DEFAULT_EPOCH]) {
+      const response = await post(app, `/api/v2/subscriptions/${id}/change_term_end`, {
+        term_ends_at: termEndsAt,
+      });
+      expect(response.status, String(termEndsAt)).toBe(400);
+      expect(response.body.param, String(termEndsAt)).toBe("term_ends_at");
+    }
+
+    // A future value is still accepted.
+    const ok = await post(app, `/api/v2/subscriptions/${id}/change_term_end`, {
+      term_ends_at: DEFAULT_EPOCH + 45 * 86400,
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.body.subscription.current_term_end).toBe(DEFAULT_EPOCH + 45 * 86400);
   });
 });
