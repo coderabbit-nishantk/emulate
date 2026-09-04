@@ -40,6 +40,9 @@ const SERVICE_NAME_LIST = [
   "clerk",
   "linear",
   "twilio",
+  // Appended rather than grouped with stripe: ports are assigned as base + index, so
+  // inserting mid-list would move every service after it.
+  "chargebee",
 ] as const;
 export type ServiceName = (typeof SERVICE_NAME_LIST)[number];
 export const SERVICE_NAMES: readonly ServiceName[] = SERVICE_NAME_LIST;
@@ -440,6 +443,30 @@ export const SERVICE_REGISTRY: Record<ServiceName, ServiceEntry> = {
         customers: [{ email: "test@example.com", name: "Test Customer" }],
         products: [{ name: "Pro Plan", description: "Monthly pro subscription" }],
         prices: [{ product_name: "Pro Plan", currency: "usd", unit_amount: 2000 }],
+      },
+    },
+  },
+  chargebee: {
+    label: "Chargebee subscription billing emulator",
+    endpoints:
+      "customers, item families, items, item prices, subscriptions, invoices, payment sources, portal sessions, hosted pages, events, time machine, webhooks, inspector",
+    async load() {
+      const mod = await import("@emulators/chargebee");
+      return { plugin: mod.chargebeePlugin, seedFromConfig: mod.seedFromConfig };
+    },
+    defaultFallback() {
+      return { login: "cb_test_admin", id: 1, scopes: [] };
+    },
+    initConfig: {
+      chargebee: {
+        item_families: [{ id: "acme", name: "Acme" }],
+        items: [{ id: "pro", name: "Pro", type: "plan", item_family: "acme" }],
+        item_prices: [
+          { id: "pro-monthly", item: "pro", name: "Pro Monthly", price: 3000, period: 1, period_unit: "month" },
+          { id: "pro-yearly", item: "pro", name: "Pro Yearly", price: 30000, period: 1, period_unit: "year" },
+        ],
+        customers: [{ id: "cbdemo_acme", email: "billing@acme.example", company: "Acme", with_card: true }],
+        subscriptions: [{ customer: "cbdemo_acme", item_price: "pro-monthly", quantity: 1 }],
       },
     },
   },
