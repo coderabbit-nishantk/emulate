@@ -94,14 +94,16 @@ Save this example as a YAML file and pass it explicitly with `--seed`; plain sta
 
 ## API Endpoints
 
-The following are independent endpoint examples, not a script to run from top to bottom. Replace placeholder IDs with values returned by the current instance before invoking each command. In particular, deleting a resource invalidates later examples using that resource. Keep URLs containing placeholders quoted so the shell cannot interpret them as redirections.
-
-### Users
+The following are independent endpoint examples, not a script to run from top to bottom. Run this shared setup in the shell used for any recipe below. Replace placeholder IDs with values returned by the current instance before invoking each command. In particular, deleting a resource invalidates later examples using that resource. Keep URLs containing placeholders quoted so the shell cannot interpret them as redirections.
 
 ```bash
 TOKEN="sk_test_emulate"
 BASE="http://localhost:4000"
+```
 
+### Users
+
+```bash
 # Create user
 curl -X POST $BASE/v1/users \
   -H "Authorization: Bearer $TOKEN" \
