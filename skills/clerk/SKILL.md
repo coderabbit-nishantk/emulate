@@ -51,8 +51,8 @@ The REST examples below are the supported starting point. An endpoint override a
 Set these only for an application or client that explicitly supports the overrides. They do not configure browser cookies, ClerkJS or an operator session by themselves.
 
 ```bash
-CLERK_API_URL=http://localhost:4000
-CLERK_SECRET_KEY=sk_test_emulate
+export CLERK_API_URL=http://localhost:4000
+export CLERK_SECRET_KEY=sk_test_emulate
 ```
 
 ### Embedded adapters

@@ -18,6 +18,8 @@ Use packages built from your project's pinned CodeRabbit fork revision. The fork
 
 Configure `--base-url` or `baseUrl` to change advertised URLs. These settings do not control listener binding. This revision exposes neither a CLI `--host` option nor a `hostname` option in `createEmulator`.
 
+The standalone CLI and `createEmulator` listeners bind all network interfaces. Atlas requests do not require valid credentials, so any host that can reach the port can read or change emulator data. Run these listeners on an isolated, trusted development network or restrict inbound access to their ports.
+
 ```bash
 # MongoDB Atlas only, with the port used throughout this guide
 npx --no-install emulate --service mongoatlas --port 4010
@@ -43,7 +45,7 @@ On test teardown, call `await atlas.close()`. Programmatic and adapter imports m
 Replace the Atlas hosts with the emulator URL. The examples below read it from `MONGOATLAS_EMULATOR_URL`, a variable your app defines; Atlas SDKs don't read it on their own.
 
 ```bash
-MONGOATLAS_EMULATOR_URL=http://localhost:4010
+export MONGOATLAS_EMULATOR_URL=http://localhost:4010
 ```
 
 | Real Atlas URL                                                              | Emulator URL                                                      |

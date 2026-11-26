@@ -7,6 +7,8 @@ description: Emulated Okta API for local development and testing. Use when the u
 
 Stateful emulation of a subset of the Okta API with users, groups, apps, authorization servers, and OAuth/OIDC. Includes lifecycle helpers, group membership, app assignment, and per-authorization-server OAuth flows. It does not reproduce Okta authorization policies or full lifecycle validation.
 
+Standalone state is in memory. Restart the process with the same seed to restore the baseline, then sign in again to obtain new codes and tokens. Each new process generates a new signing key while keeping the `kid` value `emulate-okta-1`; refresh clients' cached JWKS after a process restart before validating new ID tokens.
+
 Adapted under Apache-2.0 from [Matt Van Horn (mvanhorn), vercel-labs/emulate PR #58](https://github.com/vercel-labs/emulate/pull/58), source commit `f37c8ec2e940e414d27c5f0e51bacba5cd32404d`.
 
 ## Start
@@ -59,8 +61,8 @@ const client = new Client({
 ### Environment Variable
 
 ```bash
-OKTA_ORG_URL=http://localhost:4000
-OKTA_API_TOKEN=test_api_token
+export OKTA_ORG_URL=http://localhost:4000
+export OKTA_API_TOKEN=test_api_token
 ```
 
 ### Embedded in Next.js (adapter-next)
@@ -119,9 +121,7 @@ Without this seed, defaults include `testuser@okta.local`, Everyone, a sample ap
 
 ## API Endpoints
 
-These are independent recipes, not one sequential script. Load the seed above for the example IDs, or replace the quoted variables with IDs returned by create calls. Run reads and updates before deletion.
-
-### Users
+These are independent recipes, not one sequential script. Run this shared setup in the shell used for any recipe below. Load the seed above for the example IDs, or replace the quoted variables with IDs returned by create calls. Run reads and updates before deletion.
 
 ```bash
 TOKEN="test_api_token"
@@ -130,7 +130,11 @@ USER_ID="00u_guide_admin"
 GROUP_ID="00g_guide_engineering"
 APP_ID="0oa_guide_app"
 AUTH_SERVER_ID="default"
+```
 
+### Users
+
+```bash
 # Create user (ACTIVE by default; add ?activate=false for STAGED)
 # Use the returned id for later operations on Jane.
 curl -X POST "$BASE/api/v1/users" \
