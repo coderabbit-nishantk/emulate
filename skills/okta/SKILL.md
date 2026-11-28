@@ -15,18 +15,15 @@ The examples target the tested CodeRabbit fork runtime at commit `3ce3ebb264981c
 
 ## Start
 
-Use the deployed installation built from that exact revision. If your environment provides an explicit installed Node CLI command, use it. The block below uses the deployed package root, where `dist/index.js` is directly beneath that root. For a verified built source checkout, the CLI is at `<checkout>/packages/emulate/dist/index.js` instead.
+Use an installation that includes the runtime above. Set `EMULATE_ROOT` to the deployed package directory, where `dist/index.js` sits directly beneath the root, and save the YAML in [Seed Config](#seed-config) as `okta-seed.yaml` in your current directory. Use `OKTA_PORT` to select a different port if necessary.
 
-Standalone listeners are not restricted to loopback; a `localhost` URL only selects the client's destination. Use an isolated VM/container network or a firewall to restrict access to the port, especially because standalone management authentication is permissive. This revision has no CLI listener-host flag.
+Standalone listeners bind beyond loopback. Run the service in an isolated VM or container network, or restrict access to the port with a firewall. This revision has no listener-host flag, and standalone management authentication accepts synthetic credentials.
 
 ```bash
-# Replace this quoted path with your already installed, verified fork package.
-# An unpinned npx download does not identify this fork.
-EMULATE_ROOT="/absolute/path/to/installed/coderabbitai-emulate"
-node "$EMULATE_ROOT/dist/index.js" --service okta --port 4000
-# http://localhost:4000
-# To load the YAML below, save it as okta-seed.yaml and add --seed okta-seed.yaml.
+node "$EMULATE_ROOT/dist/index.js" --service okta --port "${OKTA_PORT:-4000}" --seed okta-seed.yaml
 ```
+
+Omit `--seed okta-seed.yaml` to use the built-in defaults. In a built checkout the CLI is at `packages/emulate/dist/index.js`.
 
 Or programmatically, when the installed `emulate` package resolves to the same fork commit:
 
@@ -43,7 +40,7 @@ const okta = await createEmulator({ service: "okta", port: 4000 });
 Standalone CLI and `createEmulator` management calls require a nonempty Authorization header:
 
 ```bash
-curl http://localhost:4000/api/v1/users \
+curl "http://localhost:${OKTA_PORT:-4000}/api/v1/users" \
   -H "Authorization: SSWS test_api_token"
 ```
 
@@ -67,7 +64,7 @@ const client = new Client({
 ### Environment Variable
 
 ```bash
-export OKTA_ORG_URL=http://localhost:4000
+export OKTA_ORG_URL="http://localhost:${OKTA_PORT:-4000}"
 export OKTA_API_TOKEN=test_api_token
 ```
 
@@ -131,7 +128,7 @@ These are independent recipes, not one sequential script. Run this shared setup 
 
 ```bash
 TOKEN="test_api_token"
-BASE="http://localhost:4000"
+BASE="http://localhost:${OKTA_PORT:-4000}"
 USER_ID="00u_guide_admin"
 GROUP_ID="00g_guide_engineering"
 APP_ID="0oa_guide_app"
@@ -141,7 +138,6 @@ AUTH_SERVER_ID="default"
 ### Users
 
 ```bash
-
 # Create user (ACTIVE by default; add ?activate=false for STAGED)
 # Use the returned id for later operations on Jane.
 curl -X POST "$BASE/api/v1/users" \
@@ -331,105 +327,41 @@ curl -X POST "$BASE/api/v1/authorizationServers/${AUTH_SERVER_ID}/lifecycle/deac
   -H "Authorization: SSWS $TOKEN"
 ```
 
-### OAuth / OIDC
+## OAuth / OIDC
 
-Org-level discovery is `/.well-known/openid-configuration` with issuer `$BASE`; named-server discovery is `/oauth2/$AUTH_SERVER_ID/.well-known/openid-configuration` with issuer `$BASE/oauth2/$AUTH_SERVER_ID`. OAuth paths are `/oauth2/v1/...` for the org and `/oauth2/$AUTH_SERVER_ID/v1/...` for a named server. Configure a matching client for the server you use. The examples here use the seeded `default` server.
+Use `http://localhost:4000/oauth2/default` as the issuer for the seeded named-server client, substituting your port if you set `OKTA_PORT`. Its discovery document is at `/oauth2/default/.well-known/openid-configuration`. Org-level discovery is at `/.well-known/openid-configuration`. Use a client registered with the issuer and callback URI your app uses.
+
+Run this setup in the same shell as the sign-in and exchange steps below. The state value here is for the synthetic example. Your app should generate and validate its own state.
 
 ```bash
+OAUTH_BASE="http://localhost:${OKTA_PORT:-4000}/oauth2/default/v1"
 CLIENT_ID="emu_okta_client_id"
 CLIENT_SECRET="emu_okta_client_secret"
 REDIRECT_URI="http://localhost:3000/api/auth/callback/okta"
-OAUTH_BASE="$BASE/oauth2/$AUTH_SERVER_ID/v1"
 
-curl "$BASE/.well-known/openid-configuration"
-curl "$BASE/oauth2/$AUTH_SERVER_ID/.well-known/openid-configuration"
-curl "$OAUTH_BASE/keys"
+okta_authorize_url() {
+  printf '%s\n' "$OAUTH_BASE/authorize?client_id=$CLIENT_ID&redirect_uri=$REDIRECT_URI&response_type=code&scope=openid+profile+email&state=okta-guide-state"
+}
 
-# After completing authorization in the browser (see below), paste its code.
-CODE="replace-with-code-from-redirect"
-curl -X POST "$OAUTH_BASE/token" \
-  --data-urlencode "grant_type=authorization_code" \
-  --data-urlencode "code=$CODE" \
-  --data-urlencode "redirect_uri=$REDIRECT_URI" \
-  --data-urlencode "client_id=$CLIENT_ID" \
-  --data-urlencode "client_secret=$CLIENT_SECRET"
-
-# Paste access_token from that response. These are synthetic local values.
-ACCESS_TOKEN="replace-with-access-token"
-curl "$OAUTH_BASE/userinfo" -H "Authorization: Bearer $ACCESS_TOKEN"
-curl -X POST "$OAUTH_BASE/introspect" \
-  --data-urlencode "token=$ACCESS_TOKEN" \
-  --data-urlencode "client_id=$CLIENT_ID" \
-  --data-urlencode "client_secret=$CLIENT_SECRET"
-curl -X POST "$OAUTH_BASE/revoke" \
-  --data-urlencode "token=$ACCESS_TOKEN" \
-  --data-urlencode "client_id=$CLIENT_ID" \
-  --data-urlencode "client_secret=$CLIENT_SECRET"
-# userinfo now returns 401; introspection reports active: false.
+okta_exchange_code() {
+  curl --silent --show-error --fail-with-body --max-time 5 "$OAUTH_BASE/token" \
+    --data-urlencode "grant_type=authorization_code" \
+    --data-urlencode "code=$1" \
+    --data-urlencode "redirect_uri=$REDIRECT_URI" \
+    --data-urlencode "client_id=$CLIENT_ID" \
+    --data-urlencode "client_secret=$CLIENT_SECRET"
+}
 ```
 
-Implemented grant handlers: `authorization_code`, `client_credentials`, `refresh_token`. This does not imply full Okta policy or grant authorization parity. For a confidential client, introspection also requires its secret. For the configured default server, a logout redirect must match a registered redirect URI.
+1. Open the URL printed by `okta_authorize_url` and choose `admin@example.com` in the Okta picker. On macOS, use `open "$(okta_authorize_url)"`.
+2. Read the code from the registered callback URL and run `okta_exchange_code "$CODE"` with that value. A successful response contains an access token and an ID token. Keep their values local.
 
-## Common Patterns
+The emulator implements authorization code, client credentials, and refresh token grants. The issuer's discovery document lists endpoints such as userinfo, introspection, and revocation. Confidential-client introspection requires its secret. A logout redirect must match a registered redirect URI.
 
-### OIDC Login Flow
+## Installed smoke check
+
+From the source checkout, use a deployed package containing this guide and the qualified runtime. Run the check in an isolated environment. It uses the bundled seed, startup command, and OAuth recipe to select the seeded active user and exchange the authorization code for tokens. It requires Bash and curl. It stops the process after the check.
 
 ```bash
-BASE="http://localhost:4000"
-
-# 1. Load the seed above, then open authorization for user selection (macOS open shown).
-open "$BASE/oauth2/default/v1/authorize?client_id=emu_okta_client_id&redirect_uri=http://localhost:3000/api/auth/callback/okta&response_type=code&scope=openid+profile+email&state=random123"
-
-# 2. After selection, paste the code from the registered callback URL.
-CODE="replace-with-code-from-redirect"
-# Exchange it at the same server. The callback app must validate state.
-curl -X POST "$BASE/oauth2/default/v1/token" \
-  -d "grant_type=authorization_code" \
-  -d "code=$CODE" \
-  -d "redirect_uri=http://localhost:3000/api/auth/callback/okta" \
-  -d "client_id=emu_okta_client_id" \
-  -d "client_secret=emu_okta_client_secret"
-
-# 3. Paste access_token from the response.
-ACCESS_TOKEN="replace-with-access-token"
-# Get user info.
-curl "$BASE/oauth2/default/v1/userinfo" \
-  -H "Authorization: Bearer $ACCESS_TOKEN"
-```
-
-### User Lifecycle Management
-
-```typescript
-import { createEmulator } from "emulate";
-
-const emu = await createEmulator({ service: "okta", port: 4000 });
-const BASE = emu.url;
-const headers = { Authorization: "SSWS test_api_token", "Content-Type": "application/json" };
-
-async function json(response: Response) {
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
-}
-
-try {
-  // Explicitly opt out of default activation.
-  let user = await json(
-    await fetch(`${BASE}/api/v1/users?activate=false`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        profile: { login: "new@example.com", email: "new@example.com", firstName: "New", lastName: "User" },
-      }),
-    }),
-  );
-  // user.status === 'STAGED'
-
-  // Parse each response; an earlier parsed object does not update itself.
-  user = await json(await fetch(`${BASE}/api/v1/users/${user.id}/lifecycle/activate`, { method: "POST", headers }));
-  // user.status === 'ACTIVE'
-  user = await json(await fetch(`${BASE}/api/v1/users/${user.id}/lifecycle/suspend`, { method: "POST", headers }));
-  // user.status === 'SUSPENDED'
-} finally {
-  await emu.close();
-}
+node scripts/smoke-okta-guide.mjs "$EMULATE_ROOT"
 ```
